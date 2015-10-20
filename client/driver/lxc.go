@@ -24,7 +24,8 @@ func NewLXCDriver(ctx *DriverContext) Driver {
 }
 
 func (d *LXCDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
-	node.Attributes["lxc.version"] = lxc.Version()
+	node.Attributes["driver.lxc.version"] = lxc.Version()
+	node.Attributes["driver.lxc"] = "1"
 	d.logger.Printf("[DEBUG] lxc.version: %s", node.Attributes["lxc.version"])
 	return true, nil
 }
