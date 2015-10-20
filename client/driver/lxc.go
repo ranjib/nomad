@@ -130,14 +130,24 @@ func (h *lxcHandle) Kill() error {
 		h.logger.Printf("[WARN] Failed to initialize container %s", err)
 		return err
 	}
-	if err := c.Stop(); err != nil {
-		h.logger.Printf("[WARN] Failed to stop container %s", err)
-		return err
+	if c.Defined() {
+		if c.State() == lxc.RUNNING {
+			if err := c.Stop(); err != nil {
+				h.logger.Printf("[WARN] Failed to stop container %s", err)
+				return err
+			}
+		} else {
+			h.logger.Println("[WARN] Container is not running. Skipping stop call")
+
+		}
+		if err := c.Destroy(); err != nil {
+			h.logger.Printf("[WARN] Failed to destroy container %s", err)
+			return err
+		}
+	} else {
+		h.logger.Println("[WARN] Cant kill non-existent container")
 	}
-	if err := c.Destroy(); err != nil {
-		h.logger.Printf("[WARN] Failed to destroy container %s", err)
-		return err
-	}
+
 	return nil
 }
 
