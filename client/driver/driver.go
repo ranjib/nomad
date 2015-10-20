@@ -21,6 +21,7 @@ var BuiltinDrivers = map[string]Factory{
 	"java":     NewJavaDriver,
 	"qemu":     NewQemuDriver,
 	"rkt":      NewRktDriver,
+	"lxc":      NewLXCDriver,
 }
 
 // NewDriver is used to instantiate and return a new driver
