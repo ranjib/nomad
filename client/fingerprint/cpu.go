@@ -34,7 +34,11 @@ func (f *CPUFingerprint) Fingerprint(cfg *config.Config, node *structs.Node) (bo
 	// Assume all CPUs found have same Model. Log if not.
 	// If CPUInfo() returns nil above, this loop is still safe
 	for _, c := range cpuInfo {
-		numCores += c.Cores
+		if c.Cores == 0 {
+			numCores += 1
+		} else {
+			numCores += c.Cores
+		}
 		mhz += c.Mhz
 
 		if modelName != "" && modelName != c.ModelName {
