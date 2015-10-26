@@ -41,7 +41,54 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	if !ok || name == "" {
 		return nil, fmt.Errorf("Missing container name for lxc driver")
 	}
+
+	clone_from, ok := task.Config["clone_from"]
+	var container *lxc.Container
+	if !ok || clone_from == "" {
+		c, err := d.createFromTemplate(name, lxcpath, task)
+		if err != nil {
+			return nil, err
+		}
+		container = c
+	} else {
+		c, err := d.createByCloning(name, lxcpath, clone_from, task)
+		if err != nil {
+			return nil, err
+		}
+		container = c
+	}
 	d.logger.Printf("[DEBUG] Using lxc name: %s", name)
+	if err := container.Start(); err != nil {
+		d.logger.Printf("[WARN] Failed to start container %s", err)
+		return nil, err
+	}
+	h := &lxcHandle{
+		Name:   name,
+		logger: d.logger,
+		doneCh: make(chan struct{}),
+		waitCh: make(chan error, 1),
+	}
+	return h, nil
+}
+
+func (d *LXCDriver) createByCloning(name, lxcpath, clone_from string, task *structs.Task) (*lxc.Container, error) {
+	c, err := lxc.NewContainer(clone_from, lxcpath)
+	if err != nil {
+		d.logger.Printf("[WARN] Failed to initialize container object %s", err)
+		return nil, err
+	}
+	if err := c.Clone(name, lxc.DefaultCloneOptions); err != nil {
+		return nil, err
+	}
+	c1, err1 := lxc.NewContainer(name, lxcpath)
+	if err1 != nil {
+		d.logger.Printf("[WARN] Failed to initialize container object %s", err1)
+		return nil, err1
+	}
+	return c1, nil
+}
+
+func (d *LXCDriver) createFromTemplate(name, lxcpath string, task *structs.Task) (*lxc.Container, error) {
 	template, ok := task.Config["template"]
 	if !ok || template == "" {
 		return nil, fmt.Errorf("Missing template name for lxc driver")
@@ -79,17 +126,7 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		d.logger.Printf("[WARN] Failed to create container %s", err)
 		return nil, err
 	}
-	if err := c.Start(); err != nil {
-		d.logger.Printf("[WARN] Failed to start container %s", err)
-		return nil, err
-	}
-	h := &lxcHandle{
-		Name:   name,
-		logger: d.logger,
-		doneCh: make(chan struct{}),
-		waitCh: make(chan error, 1),
-	}
-	return h, nil
+	return c, nil
 }
 
 func (d *LXCDriver) Open(ctx *ExecContext, name string) (DriverHandle, error) {
