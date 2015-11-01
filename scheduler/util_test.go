@@ -347,6 +347,12 @@ func TestTasksUpdated(t *testing.T) {
 	if !tasksUpdated(j1.TaskGroups[0], j6.TaskGroups[0]) {
 		t.Fatalf("bad")
 	}
+
+	j7 := mock.Job()
+	j7.TaskGroups[0].Tasks[0].Env["NEW_ENV"] = "NEW_VALUE"
+	if !tasksUpdated(j1.TaskGroups[0], j7.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
 }
 
 func TestEvictAndPlace_LimitLessThanAllocs(t *testing.T) {
@@ -555,6 +561,7 @@ func TestInplaceUpdate_Success(t *testing.T) {
 
 	updates := []allocTuple{{Alloc: alloc, TaskGroup: tg}}
 	stack := NewGenericStack(false, ctx)
+	stack.SetJob(job)
 
 	// Do the inplace update.
 	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
@@ -593,9 +600,9 @@ func TestEvictAndPlace_LimitGreaterThanAllocs(t *testing.T) {
 }
 
 func TestTaskGroupConstraints(t *testing.T) {
-	constr := &structs.Constraint{Hard: true}
+	constr := &structs.Constraint{RTarget: "bar"}
 	constr2 := &structs.Constraint{LTarget: "foo"}
-	constr3 := &structs.Constraint{Weight: 10}
+	constr3 := &structs.Constraint{Operand: "<"}
 
 	tg := &structs.TaskGroup{
 		Name:        "web",

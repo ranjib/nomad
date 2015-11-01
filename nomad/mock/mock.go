@@ -62,7 +62,6 @@ func Job() *structs.Job {
 		Datacenters: []string{"dc1"},
 		Constraints: []*structs.Constraint{
 			&structs.Constraint{
-				Hard:    true,
 				LTarget: "$attr.kernel.name",
 				RTarget: "linux",
 				Operand: "=",
@@ -79,6 +78,9 @@ func Job() *structs.Job {
 						Config: map[string]string{
 							"command": "/bin/date",
 							"args":    "+%s",
+						},
+						Env: map[string]string{
+							"FOO": "bar",
 						},
 						Resources: &structs.Resources{
 							CPU:      500,
@@ -120,7 +122,6 @@ func SystemJob() *structs.Job {
 		Datacenters: []string{"dc1"},
 		Constraints: []*structs.Constraint{
 			&structs.Constraint{
-				Hard:    true,
 				LTarget: "$attr.kernel.name",
 				RTarget: "linux",
 				Operand: "=",

@@ -1027,15 +1027,17 @@ func (t *Task) Validate() error {
 	return mErr.ErrorOrNil()
 }
 
-// Constraints are used to restrict placement options in the case of
-// a hard constraint, and used to prefer a placement in the case of
-// a soft constraint.
+const (
+	ConstraintDistinctHosts = "distinct_hosts"
+	ConstraintRegex         = "regexp"
+	ConstraintVersion       = "version"
+)
+
+// Constraints are used to restrict placement options.
 type Constraint struct {
-	Hard    bool   // Hard or soft constraint
 	LTarget string // Left-hand target
 	RTarget string // Right-hand target
 	Operand string // Constraint operand (<=, <, =, !=, >, >=), contains, near
-	Weight  int    // Soft constraints can vary the weight
 }
 
 func (c *Constraint) String() string {
@@ -1050,11 +1052,11 @@ func (c *Constraint) Validate() error {
 
 	// Perform additional validation based on operand
 	switch c.Operand {
-	case "regexp":
+	case ConstraintRegex:
 		if _, err := regexp.Compile(c.RTarget); err != nil {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("Regular expression failed to compile: %v", err))
 		}
-	case "version":
+	case ConstraintVersion:
 		if _, err := version.NewConstraint(c.RTarget); err != nil {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("Version constraint is invalid: %v", err))
 		}
@@ -1179,8 +1181,7 @@ type AllocMetric struct {
 	// NodesEvaluated is the number of nodes that were evaluated
 	NodesEvaluated int
 
-	// NodesFiltered is the number of nodes filtered due to
-	// a hard constraint
+	// NodesFiltered is the number of nodes filtered due to a constraint
 	NodesFiltered int
 
 	// ClassFiltered is the number of nodes filtered by class
