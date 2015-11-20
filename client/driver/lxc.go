@@ -3,24 +3,38 @@ package driver
 import (
 	"fmt"
 	"github.com/hashicorp/nomad/client/config"
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/mapstructure"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 	"log"
 )
 
 type LXCDriver struct {
 	DriverContext
+	fingerprint.StaticFingerprinter
+}
+
+type LXCDriverConfig struct {
+	LXCPath   string `mapstructure:"lxc_path"`
+	Name      string `mapstructure:"name"`
+	CloneFrom string `mapstructure:"clone_from"`
+	Template  string `mapstructure:"template"`
+	Distro    string `mapstructure:"distro"`
+	Release   string `mapstructure:"release"`
+	Arch      string `mapstructure:"arch"`
 }
 
 type lxcHandle struct {
 	logger *log.Logger
 	Name   string
-	waitCh chan error
+	waitCh chan *cstructs.WaitResult
 	doneCh chan struct{}
 }
 
 func NewLXCDriver(ctx *DriverContext) Driver {
-	return &LXCDriver{*ctx}
+	return &LXCDriver{DriverContext: *ctx}
 }
 
 func (d *LXCDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
@@ -31,56 +45,56 @@ func (d *LXCDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	var lxcpath = lxc.DefaultConfigPath()
-	path, ok := task.Config["lxcpath"]
-	if ok && path != "" {
-		lxcpath = path
+	var driverConfig LXCDriverConfig
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
 	}
-	d.logger.Printf("[DEBUG] Using lxcpath: %s", lxcpath)
-	name, ok := task.Config["name"]
-	if !ok || name == "" {
+	if driverConfig.LXCPath == "" {
+		driverConfig.LXCPath = lxc.DefaultConfigPath()
+	}
+	d.logger.Printf("[DEBUG] Using lxcpath: %s", driverConfig.LXCPath)
+	if driverConfig.Name == "" {
 		return nil, fmt.Errorf("Missing container name for lxc driver")
 	}
 
-	clone_from, ok := task.Config["clone_from"]
 	var container *lxc.Container
-	if !ok || clone_from == "" {
-		c, err := d.createFromTemplate(name, lxcpath, task)
+	if driverConfig.CloneFrom == "" {
+		c, err := d.createFromTemplate(driverConfig)
 		if err != nil {
 			return nil, err
 		}
 		container = c
 	} else {
-		c, err := d.createByCloning(name, lxcpath, clone_from, task)
+		c, err := d.createByCloning(driverConfig)
 		if err != nil {
 			return nil, err
 		}
 		container = c
 	}
-	d.logger.Printf("[DEBUG] Using lxc name: %s", name)
+	d.logger.Printf("[DEBUG] Using lxc name: %s", driverConfig.Name)
 	if err := container.Start(); err != nil {
 		d.logger.Printf("[WARN] Failed to start container %s", err)
 		return nil, err
 	}
 	h := &lxcHandle{
-		Name:   name,
+		Name:   driverConfig.Name,
 		logger: d.logger,
 		doneCh: make(chan struct{}),
-		waitCh: make(chan error, 1),
+		waitCh: make(chan *cstructs.WaitResult, 1),
 	}
 	return h, nil
 }
 
-func (d *LXCDriver) createByCloning(name, lxcpath, clone_from string, task *structs.Task) (*lxc.Container, error) {
-	c, err := lxc.NewContainer(clone_from, lxcpath)
+func (d *LXCDriver) createByCloning(config LXCDriverConfig) (*lxc.Container, error) {
+	c, err := lxc.NewContainer(config.CloneFrom, config.LXCPath)
 	if err != nil {
 		d.logger.Printf("[WARN] Failed to initialize container object %s", err)
 		return nil, err
 	}
-	if err := c.Clone(name, lxc.DefaultCloneOptions); err != nil {
+	if err := c.Clone(config.Name, lxc.DefaultCloneOptions); err != nil {
 		return nil, err
 	}
-	c1, err1 := lxc.NewContainer(name, lxcpath)
+	c1, err1 := lxc.NewContainer(config.Name, config.LXCPath)
 	if err1 != nil {
 		d.logger.Printf("[WARN] Failed to initialize container object %s", err1)
 		return nil, err1
@@ -88,36 +102,32 @@ func (d *LXCDriver) createByCloning(name, lxcpath, clone_from string, task *stru
 	return c1, nil
 }
 
-func (d *LXCDriver) createFromTemplate(name, lxcpath string, task *structs.Task) (*lxc.Container, error) {
-	template, ok := task.Config["template"]
-	if !ok || template == "" {
+func (d *LXCDriver) createFromTemplate(config LXCDriverConfig) (*lxc.Container, error) {
+	if config.Template == "" {
 		return nil, fmt.Errorf("Missing template name for lxc driver")
 	}
-	d.logger.Printf("[DEBUG] Using lxc template: %s", template)
-	distro, ok := task.Config["distro"]
-	if !ok || distro == "" {
+	d.logger.Printf("[DEBUG] Using lxc template: %s", config.Template)
+	if config.Distro == "" {
 		return nil, fmt.Errorf("Missing distro name for lxc driver")
 	}
-	d.logger.Printf("[DEBUG] Using lxc templare option, distro: %s", distro)
-	release, ok := task.Config["release"]
-	if !ok || release == "" {
+	d.logger.Printf("[DEBUG] Using lxc templare option, distro: %s", config.Distro)
+	if config.Release == "" {
 		return nil, fmt.Errorf("Missing release name for lxc driver")
 	}
-	d.logger.Printf("[DEBUG] Using lxc templare option, release: %s", release)
-	arch, ok := task.Config["arch"]
-	if !ok || arch == "" {
+	d.logger.Printf("[DEBUG] Using lxc templare option, release: %s", config.Release)
+	if config.Arch == "" {
 		return nil, fmt.Errorf("Missing arch name for lxc driver")
 	}
-	d.logger.Printf("[DEBUG] Using lxc templare option, arch: %s", arch)
+	d.logger.Printf("[DEBUG] Using lxc templare option, arch: %s", config.Arch)
 	options := lxc.TemplateOptions{
-		Template:             template,
-		Distro:               distro,
-		Release:              release,
-		Arch:                 arch,
+		Template:             config.Template,
+		Distro:               config.Distro,
+		Release:              config.Release,
+		Arch:                 config.Arch,
 		FlushCache:           false,
 		DisableGPGValidation: false,
 	}
-	c, err := lxc.NewContainer(name, lxcpath)
+	c, err := lxc.NewContainer(config.Name, config.LXCPath)
 	if err != nil {
 		d.logger.Printf("[WARN] Failed to initialize container object %s", err)
 		return nil, err
@@ -144,7 +154,7 @@ func (d *LXCDriver) Open(ctx *ExecContext, name string) (DriverHandle, error) {
 		Name:   name,
 		logger: d.logger,
 		doneCh: make(chan struct{}),
-		waitCh: make(chan error, 1),
+		waitCh: make(chan *cstructs.WaitResult, 1),
 	}
 	if err := c.Start(); err != nil {
 		return nil, err
@@ -156,7 +166,7 @@ func (h *lxcHandle) ID() string {
 	return h.Name
 }
 
-func (h *lxcHandle) WaitCh() chan error {
+func (h *lxcHandle) WaitCh() chan *cstructs.WaitResult {
 	return h.waitCh
 }
 
