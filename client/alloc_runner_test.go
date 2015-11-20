@@ -24,20 +24,26 @@ func (m *MockAllocStateUpdater) Update(alloc *structs.Allocation) error {
 	return m.Err
 }
 
-func testAllocRunner() (*MockAllocStateUpdater, *AllocRunner) {
+func testAllocRunner(restarts bool) (*MockAllocStateUpdater, *AllocRunner) {
 	logger := testLogger()
 	conf := DefaultConfig()
 	conf.StateDir = os.TempDir()
 	conf.AllocDir = os.TempDir()
 	upd := &MockAllocStateUpdater{}
 	alloc := mock.Alloc()
-	ar := NewAllocRunner(logger, conf, upd.Update, alloc)
+	consulClient, _ := NewConsulClient(logger, "127.0.0.1:8500")
+	if !restarts {
+		alloc.Job.Type = structs.JobTypeBatch
+		*alloc.Job.LookupTaskGroup(alloc.TaskGroup).RestartPolicy = structs.RestartPolicy{Attempts: 0}
+	}
+
+	ar := NewAllocRunner(logger, conf, upd.Update, alloc, consulClient)
 	return upd, ar
 }
 
 func TestAllocRunner_SimpleRun(t *testing.T) {
 	ctestutil.ExecCompatible(t)
-	upd, ar := testAllocRunner()
+	upd, ar := testAllocRunner(false)
 	go ar.Run()
 	defer ar.Destroy()
 
@@ -54,12 +60,12 @@ func TestAllocRunner_SimpleRun(t *testing.T) {
 
 func TestAllocRunner_Destroy(t *testing.T) {
 	ctestutil.ExecCompatible(t)
-	upd, ar := testAllocRunner()
+	upd, ar := testAllocRunner(false)
 
 	// Ensure task takes some time
 	task := ar.alloc.Job.TaskGroups[0].Tasks[0]
 	task.Config["command"] = "/bin/sleep"
-	task.Config["args"] = "10"
+	task.Config["args"] = []string{"10"}
 	go ar.Run()
 	start := time.Now()
 
@@ -76,22 +82,22 @@ func TestAllocRunner_Destroy(t *testing.T) {
 		last := upd.Allocs[upd.Count-1]
 		return last.ClientStatus == structs.AllocClientStatusDead, nil
 	}, func(err error) {
-		t.Fatalf("err: %v %#v %#v", err, upd.Allocs[0], ar.taskStatus)
+		t.Fatalf("err: %v %#v %#v", err, upd.Allocs[0], ar.alloc.TaskStates)
 	})
 
-	if time.Since(start) > time.Second {
+	if time.Since(start) > 8*time.Second {
 		t.Fatalf("took too long to terminate")
 	}
 }
 
 func TestAllocRunner_Update(t *testing.T) {
 	ctestutil.ExecCompatible(t)
-	upd, ar := testAllocRunner()
+	upd, ar := testAllocRunner(false)
 
 	// Ensure task takes some time
 	task := ar.alloc.Job.TaskGroups[0].Tasks[0]
 	task.Config["command"] = "/bin/sleep"
-	task.Config["args"] = "10"
+	task.Config["args"] = []string{"10"}
 	go ar.Run()
 	defer ar.Destroy()
 	start := time.Now()
@@ -109,26 +115,22 @@ func TestAllocRunner_Update(t *testing.T) {
 		last := upd.Allocs[upd.Count-1]
 		return last.ClientStatus == structs.AllocClientStatusDead, nil
 	}, func(err error) {
-		t.Fatalf("err: %v %#v %#v", err, upd.Allocs[0], ar.taskStatus)
+		t.Fatalf("err: %v %#v %#v", err, upd.Allocs[0], ar.alloc.TaskStates)
 	})
 
-	if time.Since(start) > time.Second {
+	if time.Since(start) > 8*time.Second {
 		t.Fatalf("took too long to terminate")
 	}
 }
 
-/*
-TODO: This test is disabled til a follow-up api changes the restore state interface.
-The driver/executor interface will be changed from Open to Cleanup, in which
-clean-up tears down previous allocs.
-
 func TestAllocRunner_SaveRestoreState(t *testing.T) {
-	upd, ar := testAllocRunner()
+	ctestutil.ExecCompatible(t)
+	upd, ar := testAllocRunner(false)
 
 	// Ensure task takes some time
 	task := ar.alloc.Job.TaskGroups[0].Tasks[0]
 	task.Config["command"] = "/bin/sleep"
-	task.Config["args"] = "10"
+	task.Config["args"] = []string{"10"}
 	go ar.Run()
 	defer ar.Destroy()
 
@@ -140,8 +142,9 @@ func TestAllocRunner_SaveRestoreState(t *testing.T) {
 	}
 
 	// Create a new alloc runner
+	consulClient, err := NewConsulClient(ar.logger, "127.0.0.1:8500")
 	ar2 := NewAllocRunner(ar.logger, ar.config, upd.Update,
-		&structs.Allocation{ID: ar.alloc.ID})
+		&structs.Allocation{ID: ar.alloc.ID}, consulClient)
 	err = ar2.RestoreState()
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -160,11 +163,10 @@ func TestAllocRunner_SaveRestoreState(t *testing.T) {
 		last := upd.Allocs[upd.Count-1]
 		return last.ClientStatus == structs.AllocClientStatusDead, nil
 	}, func(err error) {
-		t.Fatalf("err: %v %#v %#v", err, upd.Allocs[0], ar.taskStatus)
+		t.Fatalf("err: %v %#v %#v", err, upd.Allocs[0], ar.alloc.TaskStates)
 	})
 
-	if time.Since(start) > time.Second {
+	if time.Since(start) > 15*time.Second {
 		t.Fatalf("took too long to terminate")
 	}
 }
-*/

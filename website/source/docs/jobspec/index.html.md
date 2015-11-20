@@ -47,6 +47,15 @@ job "my-service" {
             config {
                 image = "hashicorp/web-frontend"
             }
+            service {
+                port = "http"
+                check {
+                    type = "http"
+                    path = "/health"
+                    interval = "10s"
+                    timeout = "2s"
+                }
+            }
             env {
                 DB_HOST = "db01.example.com"
                 DB_USER = "web"
@@ -57,10 +66,13 @@ job "my-service" {
                 memory = 128
                 network {
                     mbits = 100
-                    dynamic_ports = [
-                      "http",
-                      "https",
-                    ]
+                    # Request for a dynamic port
+                    port "http" {
+                    }
+                    # Request for a static port
+                    port "https" {
+                        static = 443
+                    }
                 }
             }
         }
@@ -81,7 +93,7 @@ where a task is eligible for running. An example constraint looks like:
 ```
 # Restrict to only nodes running linux
 constraint {
-    attribute = "$attr.kernel.os"
+    attribute = "$attr.kernel.name"
     value = "linux"
 }
 ```
@@ -135,7 +147,8 @@ The `job` object supports the following keys:
 
 * `type` - Specifies the job type and switches which scheduler
   is used. Nomad provides the `service`, `system` and `batch` schedulers,
-  and defaults to `service`.
+  and defaults to `service`. To learn more about each scheduler type visit
+  [here](/docs/jobspec/schedulers.html)
 
 * `update` - Specifies the task update strategy. This requires providing
   `max_parallel` as an integer and `stagger` as a time duration. If stagger
@@ -153,6 +166,10 @@ The `group` object supports the following keys:
 * `constraint` - This can be provided multiple times to define additional
   constraints. See the constraint reference for more details.
 
+* `restart` - Specifies the restart policy to be applied to tasks in this group.
+  If omitted, a default policy for batch and non-batch jobs is used based on the
+  job type. See the restart policy reference for more details.
+
 * `task` - This can be specified multiple times, to add a task as
   part of the group.
 
@@ -164,7 +181,7 @@ The `task` object supports the following keys:
 
 * `driver` - Specifies the task driver that should be used to run the
   task. See the [driver documentation](/docs/drivers/index.html) for what
-  is available. Examples include "docker", "qemu", "java", and "exec".
+  is available. Examples include `docker`, `qemu`, `java`, and `exec`.
 
 * `constraint` - This can be provided multiple times to define additional
   constraints. See the constraint reference for more details.
@@ -172,6 +189,11 @@ The `task` object supports the following keys:
 * `config` - A map of key/value configuration passed into the driver
   to start the task. The details of configurations are specific to
   each driver.
+
+* `service` - Nomad integrates with Consul for Service Discovery. A service 
+  block represents a routable and discoverable service on the network. Nomad
+  automatically registers when a Task is started and de-registers it when the
+  Task transitons to the DEAD state. To learn more about Services please visit [here](/docs/jobspec/servicediscovery.html)
 
 * `env` - A map of key/value representing environment variables that
   will be passed along to the running process.
@@ -209,6 +231,43 @@ The `network` object supports the following keys:
   For applications that cannot use a dynamic port, they can
   request a specific port.
 
+### Restart Policy
+
+The `restart` object supports the following keys:
+
+* `attempts` - For `batch` jobs, `attempts` is the maximum number of restarts
+  allowed before the task is failed. For non-batch jobs, the `attempts` is the
+  number of restarts allowed in an `interval` before a restart delay is added.
+
+* `interval` - `interval` is only valid on non-batch jobs and is a time duration
+  that can be specified using the `s`, `m`, and `h` suffixes, such as `30s`.
+  The `interval` begins when the first task starts and ensures that only
+  `attempts` number of restarts happens within it. If more than `attempts`
+  number of failures happen, the restart is delayed till after the `interval`,
+  which is then reset.
+
+* `delay` - A duration to wait before restarting a task. It is specified as a
+  time duration using the `s`, `m`, and `h` suffixes, such as `30s`.
+
+The default `batch` restart policy is:
+
+```
+restart {
+    attempts = 15
+    delay = "15s"
+}
+```
+
+The default non-batch restart policy is:
+
+```
+restart {
+    interval = "1m"
+    attempts = 2
+    delay = "15s"
+}
+```
+
 ### Constraint
 
 The `constraint` object supports the following keys:
@@ -224,7 +283,7 @@ The `constraint` object supports the following keys:
   This can be a literal value or another attribute.
 
 * `version` - Specifies a version constraint against the attribute.
-  This sets the operator to "version" and the `value` to what is
+  This sets the operator to `version` and the `value` to what is
   specified. This supports a comma seperated list of constraints,
   including the pessimistic operator. See the
   [go-version](https://github.com/hashicorp/go-version) repository
@@ -234,17 +293,17 @@ The `constraint` object supports the following keys:
   the attribute. This sets the operator to "regexp" and the `value`
   to the regular expression.
 
-* `distinct_hosts` - `distinct_hosts` accepts a boolean `true`. The default is
-  `false`.
+*   `distinct_hosts` - `distinct_hosts` accepts a boolean `true`. The default is
+    `false`.
 
-  When `distinct_hosts` is `true` at the Job level, each instance of all Task
-  Groups specified in the job is placed on a separate host.
+    When `distinct_hosts` is `true` at the Job level, each instance of all Task
+    Groups specified in the job is placed on a separate host.
 
-  When `distinct_hosts` is `true` at the Task Group level with count > 1, each
-  instance of a Task Group is placed on a separate host. Different task groups in
-  the same job _may_ be co-scheduled.
+    When `distinct_hosts` is `true` at the Task Group level with count > 1, each
+    instance of a Task Group is placed on a separate host. Different task groups in
+    the same job _may_ be co-scheduled.
 
-  Tasks within a task group are always co-scheduled.
+    Tasks within a task group are always co-scheduled.
 
 Below is a table documenting the variables that can be interpreted:
 
@@ -284,7 +343,7 @@ Below is a table documenting common node attributes:
   </tr>
   <tr>
     <td>arch</td>
-    <td>CPU architecture of the client. Examples: "amd64", "386"</td>
+    <td>CPU architecture of the client. Examples: `amd64`, `386`</td>
   </tr>
   <tr>
     <td>consul.datacenter</td>
@@ -303,6 +362,14 @@ Below is a table documenting common node attributes:
     <td>Hostname of the client</td>
   </tr>
   <tr>
+    <td>kernel.name</td>
+    <td>Kernel of the client. Examples: `linux`, `darwin`</td>
+  </tr>
+  <tr>
+    <td>kernel.version</td>
+    <td>Version of the client kernel. Examples: `3.19.0-25-generic`, `15.0.0`</td>
+  </tr>
+  <tr>
     <td>platform.aws.ami-id</td>
     <td>On EC2, the AMI ID of the client node</td>
   </tr>
@@ -312,7 +379,7 @@ Below is a table documenting common node attributes:
   </tr>
   <tr>
     <td>os.name</td>
-    <td>Operating system of the client. Examples: "linux", "windows", "darwin"</td>
+    <td>Operating system of the client. Examples: `ubuntu`, `windows`, `darwin`</td>
   </tr>
   <tr>
     <td>os.version</td>

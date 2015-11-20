@@ -14,8 +14,10 @@ import (
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/args"
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/mapstructure"
 )
 
 type DockerDriver struct {
@@ -23,19 +25,55 @@ type DockerDriver struct {
 	fingerprint.StaticFingerprinter
 }
 
+type DockerDriverAuth struct {
+	Username      string `mapstructure:"username"`       // username for the registry
+	Password      string `mapstructure:"password"`       // password to access the registry
+	Email         string `mapstructure:"email"`          // email address of the user who is allowed to access the registry
+	ServerAddress string `mapstructure:"server_address"` // server address of the registry
+}
+
+type DockerDriverConfig struct {
+	ImageName        string              `mapstructure:"image"`              // Container's Image Name
+	Command          string              `mapstructure:"command"`            // The Command/Entrypoint to run when the container starts up
+	Args             []string            `mapstructure:"args"`               // The arguments to the Command/Entrypoint
+	NetworkMode      string              `mapstructure:"network_mode"`       // The network mode of the container - host, net and none
+	PortMap          []map[string]int    `mapstructure:"port_map"`           // A map of host port labels and the ports exposed on the container
+	Privileged       bool                `mapstructure:"privileged"`         // Flag to run the container in priviledged mode
+	DNSServers       []string            `mapstructure:"dns_servers"`        // DNS Server for containers
+	DNSSearchDomains []string            `mapstructure:"dns_search_domains"` // DNS Search domains for containers
+	Hostname         string              `mapstructure:"hostname"`           // Hostname for containers
+	Labels           []map[string]string `mapstructure:"labels"`             // Labels to set when the container starts up
+	Auth             []DockerDriverAuth  `mapstructure:"auth"`               // Authentication credentials for a private Docker registry
+}
+
+func (c *DockerDriverConfig) Validate() error {
+	if c.ImageName == "" {
+		return fmt.Errorf("Docker Driver needs an image name")
+	}
+
+	if len(c.PortMap) > 1 {
+		return fmt.Errorf("Only one port_map block is allowed in the docker driver config")
+	}
+
+	if len(c.Labels) > 1 {
+		return fmt.Errorf("Only one labels block is allowed in the docker driver config")
+	}
+	return nil
+}
+
 type dockerPID struct {
 	ImageID     string
 	ContainerID string
 }
 
-type dockerHandle struct {
+type DockerHandle struct {
 	client           *docker.Client
 	logger           *log.Logger
 	cleanupContainer bool
 	cleanupImage     bool
 	imageID          string
 	containerID      string
-	waitCh           chan error
+	waitCh           chan *cstructs.WaitResult
 	doneCh           chan struct{}
 }
 
@@ -64,26 +102,16 @@ func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool
 	// Initialize docker API client
 	client, err := d.dockerClient()
 	if err != nil {
-		d.logger.Printf("[DEBUG] driver.docker: could not connect to docker daemon: %s", err)
+		d.logger.Printf("[INFO] driver.docker: failed to initialize client: %s", err)
 		return false, nil
 	}
 
-	privileged, err := strconv.ParseBool(d.config.ReadDefault("docker.privileged.enabled", "false"))
-	if err != nil {
-		return false, fmt.Errorf("Unable to parse docker.privileged.enabled: %s", err)
-	}
-	if privileged == true {
-		d.logger.Printf("[DEBUG] driver.docker: privileged containers enabled. Only enable if needed")
+	privileged := d.config.ReadBoolDefault("docker.privileged.enabled", false)
+	if privileged {
+		d.logger.Println("[INFO] driver.docker: privileged containers are enabled")
 		node.Attributes["docker.privileged.enabled"] = "1"
-	}
-
-	_, err = strconv.ParseBool(d.config.ReadDefault("docker.cleanup.container", "true"))
-	if err != nil {
-		return false, fmt.Errorf("Unable to parse docker.cleanup.container: %s", err)
-	}
-	_, err = strconv.ParseBool(d.config.ReadDefault("docker.cleanup.image", "true"))
-	if err != nil {
-		return false, fmt.Errorf("Unable to parse docker.cleanup.image: %s", err)
+	} else {
+		d.logger.Println("[INFO] driver.docker: privileged containers are disabled")
 	}
 
 	// This is the first operation taken on the client so we'll try to
@@ -91,7 +119,7 @@ func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool
 	// Docker isn't available so we'll simply disable the docker driver.
 	env, err := client.Version()
 	if err != nil {
-		d.logger.Printf("[INFO] driver.docker: connection to daemon failed: %s", err)
+		d.logger.Printf("[INFO] driver.docker: could not connect to docker daemon at %s: %s", client.Endpoint(), err)
 		return false, nil
 	}
 	node.Attributes["driver.docker"] = "1"
@@ -116,16 +144,28 @@ func (d *DockerDriver) containerBinds(alloc *allocdir.AllocDir, task *structs.Ta
 }
 
 // createContainer initializes a struct needed to call docker.client.CreateContainer()
-func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task) (docker.CreateContainerOptions, error) {
+func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task, driverConfig *DockerDriverConfig) (docker.CreateContainerOptions, error) {
 	var c docker.CreateContainerOptions
 	if task.Resources == nil {
-		d.logger.Printf("[ERR] driver.docker: task.Resources is empty")
-		return c, fmt.Errorf("task.Resources is nil and we can't constrain resource usage. We shouldn't have been able to schedule this in the first place.")
+		// Guard against missing resources. We should never have been able to
+		// schedule a job without specifying this.
+		d.logger.Println("[ERR] driver.docker: task.Resources is empty")
+		return c, fmt.Errorf("task.Resources is empty")
 	}
 
 	binds, err := d.containerBinds(ctx.AllocDir, task)
 	if err != nil {
 		return c, err
+	}
+
+	// Create environment variables.
+	env := TaskEnvironmentVariables(ctx, task)
+	env.SetAllocDir(filepath.Join("/", allocdir.SharedAllocName))
+	env.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
+
+	config := &docker.Config{
+		Image:    driverConfig.ImageName,
+		Hostname: driverConfig.Hostname,
 	}
 
 	hostConfig := &docker.HostConfig{
@@ -169,136 +209,132 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task) (do
 	d.logger.Printf("[DEBUG] driver.docker: binding directories %#v for %s", hostConfig.Binds, task.Config["image"])
 
 	//  set privileged mode
-	hostPrivileged, err := strconv.ParseBool(d.config.ReadDefault("docker.privileged.enabled", "false"))
-	if err != nil {
-		return c, fmt.Errorf("Unable to parse docker.privileged.enabled: %s", err)
+	hostPrivileged := d.config.ReadBoolDefault("docker.privileged.enabled", false)
+	if driverConfig.Privileged && !hostPrivileged {
+		return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent`)
 	}
-
-	if v, ok := task.Config["privileged"]; ok {
-		taskPrivileged, err := strconv.ParseBool(v)
-		if err != nil {
-			return c, fmt.Errorf("Unable to parse boolean value from task config option 'privileged': %v", err)
-		}
-		if taskPrivileged && !hostPrivileged {
-			return c, fmt.Errorf(`Unable to set privileged flag since "docker.privileged.enabled" is false`)
-		}
-
-		hostConfig.Privileged = taskPrivileged
-	}
+	hostConfig.Privileged = hostPrivileged
 
 	// set DNS servers
-	dns, ok := task.Config["dns-servers"]
-
-	if ok && dns != "" {
-		for _, v := range strings.Split(dns, ",") {
-			ip := strings.TrimSpace(v)
-			if net.ParseIP(ip) != nil {
-				hostConfig.DNS = append(hostConfig.DNS, ip)
-			} else {
-				d.logger.Printf("[ERR] driver.docker: invalid ip address for container dns server: %s", ip)
-			}
+	for _, ip := range driverConfig.DNSServers {
+		if net.ParseIP(ip) != nil {
+			hostConfig.DNS = append(hostConfig.DNS, ip)
+		} else {
+			d.logger.Printf("[ERR] driver.docker: invalid ip address for container dns server: %s", ip)
 		}
 	}
 
 	// set DNS search domains
-	dnsSearch, ok := task.Config["search-domains"]
-
-	if ok && dnsSearch != "" {
-		for _, v := range strings.Split(dnsSearch, ",") {
-			hostConfig.DNSSearch = append(hostConfig.DNSSearch, strings.TrimSpace(v))
-		}
+	for _, domain := range driverConfig.DNSSearchDomains {
+		hostConfig.DNSSearch = append(hostConfig.DNSSearch, domain)
 	}
 
-	mode, ok := task.Config["network_mode"]
-	if !ok || mode == "" {
+	hostConfig.NetworkMode = driverConfig.NetworkMode
+	if hostConfig.NetworkMode == "" {
 		// docker default
-		d.logger.Printf("[WARN] driver.docker: no mode specified for networking, defaulting to bridge")
-		mode = "bridge"
+		d.logger.Println("[DEBUG] driver.docker: networking mode not specified; defaulting to bridge")
+		hostConfig.NetworkMode = "bridge"
 	}
 
-	// Ignore the container mode for now
-	switch mode {
-	case "default", "bridge", "none", "host":
-		d.logger.Printf("[DEBUG] driver.docker: using %s as network mode", mode)
-	default:
-		d.logger.Printf("[ERR] driver.docker: invalid setting for network mode: %s", mode)
-		return c, fmt.Errorf("Invalid setting for network mode: %s", mode)
-	}
-	hostConfig.NetworkMode = mode
-
-	// Setup port mapping (equivalent to -p on docker CLI). Ports must already be
-	// exposed in the container.
+	// Setup port mapping and exposed ports
 	if len(task.Resources.Networks) == 0 {
-		d.logger.Print("[WARN] driver.docker: No networks are available for port mapping")
+		d.logger.Println("[DEBUG] driver.docker: No network interfaces are available")
+		if len(driverConfig.PortMap) == 1 && len(driverConfig.PortMap[0]) > 0 {
+			return c, fmt.Errorf("Trying to map ports but no network interface is available")
+		}
 	} else {
+		// TODO add support for more than one network
 		network := task.Resources.Networks[0]
-		dockerPorts := map[docker.Port][]docker.PortBinding{}
+		publishedPorts := map[docker.Port][]docker.PortBinding{}
+		exposedPorts := map[docker.Port]struct{}{}
 
-		for _, port := range network.ListStaticPorts() {
-			dockerPorts[docker.Port(strconv.Itoa(port)+"/tcp")] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: strconv.Itoa(port)}}
-			dockerPorts[docker.Port(strconv.Itoa(port)+"/udp")] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: strconv.Itoa(port)}}
-			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (static)\n", network.IP, port, port)
+		for _, port := range network.ReservedPorts {
+			hostPortStr := strconv.Itoa(port.Value)
+			containerPort := docker.Port(hostPortStr)
+
+			publishedPorts[containerPort+"/tcp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
+			publishedPorts[containerPort+"/udp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
+			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (static)", network.IP, port.Value, port.Value)
+
+			exposedPorts[containerPort+"/tcp"] = struct{}{}
+			exposedPorts[containerPort+"/udp"] = struct{}{}
+			d.logger.Printf("[DEBUG] driver.docker: exposed port %d", port.Value)
 		}
 
-		for label, port := range network.MapDynamicPorts() {
-			// If the label is numeric we expect that there is a service
-			// listening on that port inside the container. In this case we'll
-			// setup a mapping from our random host port to the label port.
-			//
-			// Otherwise we'll setup a direct 1:1 mapping from the host port to
-			// the container, and assume that the process inside will read the
-			// environment variable and bind to the correct port.
-			if _, err := strconv.Atoi(label); err == nil {
-				dockerPorts[docker.Port(label+"/tcp")] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: strconv.Itoa(port)}}
-				dockerPorts[docker.Port(label+"/udp")] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: strconv.Itoa(port)}}
-				d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %s (mapped)", network.IP, port, label)
-			} else {
-				dockerPorts[docker.Port(strconv.Itoa(port)+"/tcp")] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: strconv.Itoa(port)}}
-				dockerPorts[docker.Port(strconv.Itoa(port)+"/udp")] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: strconv.Itoa(port)}}
-				d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d for label %s\n", network.IP, port, port, label)
+		containerToHostPortMap := make(map[string]int)
+		for _, port := range network.DynamicPorts {
+			// By default we will map the allocated port 1:1 to the container
+			containerPortInt := port.Value
+
+			// If the user has mapped a port using port_map we'll change it here
+			if len(driverConfig.PortMap) == 1 {
+				mapped, ok := driverConfig.PortMap[0][port.Label]
+				if ok {
+					containerPortInt = mapped
+				}
 			}
+
+			hostPortStr := strconv.Itoa(port.Value)
+			// containerPort := docker.Port(hostPortStr)
+			containerPort := docker.Port(strconv.Itoa(containerPortInt))
+
+			publishedPorts[containerPort+"/tcp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
+			publishedPorts[containerPort+"/udp"] = []docker.PortBinding{docker.PortBinding{HostIP: network.IP, HostPort: hostPortStr}}
+			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (mapped)", network.IP, port.Value, containerPortInt)
+
+			exposedPorts[containerPort+"/tcp"] = struct{}{}
+			exposedPorts[containerPort+"/udp"] = struct{}{}
+			d.logger.Printf("[DEBUG] driver.docker: exposed port %s", hostPortStr)
+
+			containerToHostPortMap[string(containerPort)] = port.Value
 		}
-		hostConfig.PortBindings = dockerPorts
+
+		env.SetPorts(containerToHostPortMap)
+		hostConfig.PortBindings = publishedPorts
+		config.ExposedPorts = exposedPorts
 	}
 
-	// Create environment variables.
-	env := TaskEnvironmentVariables(ctx, task)
-	env.SetAllocDir(filepath.Join("/", allocdir.SharedAllocName))
-	env.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
+	parsedArgs := args.ParseAndReplace(driverConfig.Args, env.Map())
 
-	config := &docker.Config{
-		Env:   env.List(),
-		Image: task.Config["image"],
-	}
-
-	rawArgs, hasArgs := task.Config["args"]
-	parsedArgs, err := args.ParseAndReplace(rawArgs, env.Map())
-	if err != nil {
-		return c, err
-	}
-
-	// If the user specified a custom command to run, we'll inject it here.
-	if command, ok := task.Config["command"]; ok {
-		cmd := []string{command}
-		if hasArgs {
+	// If the user specified a custom command to run as their entrypoint, we'll
+	// inject it here.
+	if driverConfig.Command != "" {
+		cmd := []string{driverConfig.Command}
+		if len(driverConfig.Args) != 0 {
 			cmd = append(cmd, parsedArgs...)
 		}
+		d.logger.Printf("[DEBUG] driver.docker: setting container startup command to: %s", strings.Join(cmd, " "))
 		config.Cmd = cmd
-	} else if hasArgs {
-		d.logger.Println("[DEBUG] driver.docker: ignoring args because command not specified")
+	} else if len(driverConfig.Args) != 0 {
+		d.logger.Println("[DEBUG] driver.docker: ignoring command arguments because command is not specified")
 	}
 
+	if len(driverConfig.Labels) == 1 {
+		config.Labels = driverConfig.Labels[0]
+		d.logger.Printf("[DEBUG] driver.docker: applied labels on the container: %+v", config.Labels)
+	}
+
+	config.Env = env.List()
+
+	containerName := fmt.Sprintf("%s-%s", task.Name, ctx.AllocID)
+	d.logger.Printf("[DEBUG] driver.docker: setting container name to: %s", containerName)
+
 	return docker.CreateContainerOptions{
+		Name:       containerName,
 		Config:     config,
 		HostConfig: hostConfig,
 	}, nil
 }
 
 func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	// Get the image from config
-	image, ok := task.Config["image"]
-	if !ok || image == "" {
-		return nil, fmt.Errorf("Image not specified")
+	var driverConfig DockerDriverConfig
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
+	}
+	image := driverConfig.ImageName
+
+	if err := driverConfig.Validate(); err != nil {
+		return nil, err
 	}
 	if task.Resources == nil {
 		return nil, fmt.Errorf("Resources are not specified")
@@ -310,14 +346,8 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, fmt.Errorf("CPU limit cannot be zero")
 	}
 
-	cleanupContainer, err := strconv.ParseBool(d.config.ReadDefault("docker.cleanup.container", "true"))
-	if err != nil {
-		return nil, fmt.Errorf("Unable to parse docker.cleanup.container: %s", err)
-	}
-	cleanupImage, err := strconv.ParseBool(d.config.ReadDefault("docker.cleanup.image", "true"))
-	if err != nil {
-		return nil, fmt.Errorf("Unable to parse docker.cleanup.image: %s", err)
-	}
+	cleanupContainer := d.config.ReadBoolDefault("docker.cleanup.container", true)
+	cleanupImage := d.config.ReadBoolDefault("docker.cleanup.image", true)
 
 	// Initialize docker API client
 	client, err := d.dockerClient()
@@ -347,16 +377,19 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 			Tag:        tag,
 		}
 
-		authOptions := docker.AuthConfiguration{
-			Username:      task.Config["auth.username"],
-			Password:      task.Config["auth.password"],
-			Email:         task.Config["auth.email"],
-			ServerAddress: task.Config["auth.server-address"],
+		authOptions := docker.AuthConfiguration{}
+		if len(driverConfig.Auth) != 0 {
+			authOptions = docker.AuthConfiguration{
+				Username:      driverConfig.Auth[0].Username,
+				Password:      driverConfig.Auth[0].Password,
+				Email:         driverConfig.Auth[0].Email,
+				ServerAddress: driverConfig.Auth[0].ServerAddress,
+			}
 		}
 
 		err = client.PullImage(pullOptions, authOptions)
 		if err != nil {
-			d.logger.Printf("[ERR] driver.docker: pulling container %s", err)
+			d.logger.Printf("[ERR] driver.docker: failed pulling container %s:%s: %s", repo, tag, err)
 			return nil, fmt.Errorf("Failed to pull `%s`: %s", image, err)
 		}
 		d.logger.Printf("[DEBUG] driver.docker: docker pull %s:%s succeeded", repo, tag)
@@ -364,36 +397,73 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		// Now that we have the image we can get the image id
 		dockerImage, err = client.InspectImage(image)
 		if err != nil {
-			d.logger.Printf("[ERR] driver.docker: getting image id for %s", image)
+			d.logger.Printf("[ERR] driver.docker: failed getting image id for %s: %s", image, err)
 			return nil, fmt.Errorf("Failed to determine image id for `%s`: %s", image, err)
 		}
 	}
-	d.logger.Printf("[DEBUG] driver.docker: using image %s", dockerImage.ID)
-	d.logger.Printf("[INFO] driver.docker: identified image %s as %s", image, dockerImage.ID)
+	d.logger.Printf("[DEBUG] driver.docker: identified image %s as %s", image, dockerImage.ID)
 
-	config, err := d.createContainer(ctx, task)
+	config, err := d.createContainer(ctx, task, &driverConfig)
 	if err != nil {
-		d.logger.Printf("[ERR] driver.docker: %s", err)
-		return nil, fmt.Errorf("Failed to create container config for image %s", image)
+		d.logger.Printf("[ERR] driver.docker: failed to create container configuration for image %s: %s", image, err)
+		return nil, fmt.Errorf("Failed to create container configuration for image %s: %s", image, err)
 	}
 	// Create a container
 	container, err := client.CreateContainer(config)
 	if err != nil {
-		d.logger.Printf("[ERR] driver.docker: %s", err)
-		return nil, fmt.Errorf("Failed to create container from image %s", image)
+		// If the container already exists because of a previous failure we'll
+		// try to purge it and re-create it.
+		if strings.Contains(err.Error(), "container already exists") {
+			// Get the ID of the existing container so we can delete it
+			containers, err := client.ListContainers(docker.ListContainersOptions{
+				// The image might be in use by a stopped container, so check everything
+				All: true,
+				Filters: map[string][]string{
+					"name": []string{config.Name},
+				},
+			})
+			if err != nil {
+				log.Printf("[ERR] driver.docker: failed to query list of containers matching name:%s", config.Name)
+				return nil, fmt.Errorf("Failed to query list of containers: %s", err)
+			}
+
+			if len(containers) != 1 {
+				log.Printf("[ERR] driver.docker: failed to get id for container %s", config.Name)
+				return nil, fmt.Errorf("Failed to get id for container %s", config.Name)
+			}
+
+			log.Printf("[INFO] driver.docker: a container with the name %s already exists; will attempt to purge and re-create", config.Name)
+			err = client.RemoveContainer(docker.RemoveContainerOptions{
+				ID: containers[0].ID,
+			})
+			if err != nil {
+				log.Printf("[ERR] driver.docker: failed to purge container %s", config.Name)
+				return nil, fmt.Errorf("Failed to purge container %s: %s", config.Name, err)
+			}
+			log.Printf("[INFO] driver.docker: purged container %s", config.Name)
+			container, err = client.CreateContainer(config)
+			if err != nil {
+				log.Printf("[ERR] driver.docker: failed to re-create container %s; aborting", config.Name)
+				return nil, fmt.Errorf("Failed to re-create container %s; aborting", config.Name)
+			}
+		} else {
+			// We failed to create the container for some other reason.
+			d.logger.Printf("[ERR] driver.docker: failed to create container from image %s: %s", image, err)
+			return nil, fmt.Errorf("Failed to create container from image %s: %s", image, err)
+		}
 	}
 	d.logger.Printf("[INFO] driver.docker: created container %s", container.ID)
 
 	// Start the container
 	err = client.StartContainer(container.ID, container.HostConfig)
 	if err != nil {
-		d.logger.Printf("[ERR] driver.docker: starting container %s", container.ID)
-		return nil, fmt.Errorf("Failed to start container %s", container.ID)
+		d.logger.Printf("[ERR] driver.docker: failed to start container %s: %s", container.ID, err)
+		return nil, fmt.Errorf("Failed to start container %s: %s", container.ID, err)
 	}
 	d.logger.Printf("[INFO] driver.docker: started container %s", container.ID)
 
 	// Return a driver handle
-	h := &dockerHandle{
+	h := &DockerHandle{
 		client:           client,
 		cleanupContainer: cleanupContainer,
 		cleanupImage:     cleanupImage,
@@ -401,27 +471,20 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		imageID:          dockerImage.ID,
 		containerID:      container.ID,
 		doneCh:           make(chan struct{}),
-		waitCh:           make(chan error, 1),
+		waitCh:           make(chan *cstructs.WaitResult, 1),
 	}
 	go h.run()
 	return h, nil
 }
 
 func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
-	cleanupContainer, err := strconv.ParseBool(d.config.ReadDefault("docker.cleanup.container", "true"))
-	if err != nil {
-		return nil, fmt.Errorf("Unable to parse docker.cleanup.container: %s", err)
-	}
-	cleanupImage, err := strconv.ParseBool(d.config.ReadDefault("docker.cleanup.image", "true"))
-	if err != nil {
-		return nil, fmt.Errorf("Unable to parse docker.cleanup.image: %s", err)
-	}
+	cleanupContainer := d.config.ReadBoolDefault("docker.cleanup.container", true)
+	cleanupImage := d.config.ReadBoolDefault("docker.cleanup.image", true)
 
 	// Split the handle
 	pidBytes := []byte(strings.TrimPrefix(handleID, "DOCKER:"))
 	pid := &dockerPID{}
-	err = json.Unmarshal(pidBytes, pid)
-	if err != nil {
+	if err := json.Unmarshal(pidBytes, pid); err != nil {
 		return nil, fmt.Errorf("Failed to parse handle '%s': %v", handleID, err)
 	}
 	d.logger.Printf("[INFO] driver.docker: re-attaching to docker process: %s", handleID)
@@ -453,7 +516,7 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 	}
 
 	// Return a driver handle
-	h := &dockerHandle{
+	h := &DockerHandle{
 		client:           client,
 		cleanupContainer: cleanupContainer,
 		cleanupImage:     cleanupImage,
@@ -461,13 +524,13 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 		imageID:          pid.ImageID,
 		containerID:      pid.ContainerID,
 		doneCh:           make(chan struct{}),
-		waitCh:           make(chan error, 1),
+		waitCh:           make(chan *cstructs.WaitResult, 1),
 	}
 	go h.run()
 	return h, nil
 }
 
-func (h *dockerHandle) ID() string {
+func (h *DockerHandle) ID() string {
 	// Return a handle to the PID
 	pid := dockerPID{
 		ImageID:     h.imageID,
@@ -480,21 +543,25 @@ func (h *dockerHandle) ID() string {
 	return fmt.Sprintf("DOCKER:%s", string(data))
 }
 
-func (h *dockerHandle) WaitCh() chan error {
+func (h *DockerHandle) ContainerID() string {
+	return h.containerID
+}
+
+func (h *DockerHandle) WaitCh() chan *cstructs.WaitResult {
 	return h.waitCh
 }
 
-func (h *dockerHandle) Update(task *structs.Task) error {
+func (h *DockerHandle) Update(task *structs.Task) error {
 	// Update is not possible
 	return nil
 }
 
 // Kill is used to terminate the task. This uses docker stop -t 5
-func (h *dockerHandle) Kill() error {
+func (h *DockerHandle) Kill() error {
 	// Stop the container
 	err := h.client.StopContainer(h.containerID, 5)
 	if err != nil {
-		log.Printf("[ERR] driver.docker: failed stopping container %s", h.containerID)
+		log.Printf("[ERR] driver.docker: failed to stop container %s", h.containerID)
 		return fmt.Errorf("Failed to stop container %s: %s", h.containerID, err)
 	}
 	log.Printf("[INFO] driver.docker: stopped container %s", h.containerID)
@@ -506,7 +573,7 @@ func (h *dockerHandle) Kill() error {
 			RemoveVolumes: true,
 		})
 		if err != nil {
-			log.Printf("[ERR] driver.docker: removing container %s", h.containerID)
+			log.Printf("[ERR] driver.docker: failed to remove container %s", h.containerID)
 			return fmt.Errorf("Failed to remove container %s: %s", h.containerID, err)
 		}
 		log.Printf("[INFO] driver.docker: removed container %s", h.containerID)
@@ -525,11 +592,12 @@ func (h *dockerHandle) Kill() error {
 				},
 			})
 			if err != nil {
-				return fmt.Errorf("Unable to query list of containers: %s", err)
+				log.Printf("[ERR] driver.docker: failed to query list of containers matching image:%s", h.imageID)
+				return fmt.Errorf("Failed to query list of containers: %s", err)
 			}
 			inUse := len(containers)
 			if inUse > 0 {
-				log.Printf("[INFO] driver.docker: image %s is still in use by %d containers", h.imageID, inUse)
+				log.Printf("[INFO] driver.docker: image %s is still in use by %d container(s)", h.imageID, inUse)
 			} else {
 				return fmt.Errorf("Failed to remove image %s", h.imageID)
 			}
@@ -540,11 +608,11 @@ func (h *dockerHandle) Kill() error {
 	return nil
 }
 
-func (h *dockerHandle) run() {
+func (h *DockerHandle) run() {
 	// Wait for it...
 	exitCode, err := h.client.WaitContainer(h.containerID)
 	if err != nil {
-		h.logger.Printf("[ERR] driver.docker: unable to wait for %s; container already terminated", h.containerID)
+		h.logger.Printf("[ERR] driver.docker: failed to wait for %s; container already terminated", h.containerID)
 	}
 
 	if exitCode != 0 {
@@ -552,8 +620,6 @@ func (h *dockerHandle) run() {
 	}
 
 	close(h.doneCh)
-	if err != nil {
-		h.waitCh <- err
-	}
+	h.waitCh <- cstructs.NewWaitResult(exitCode, 0, err)
 	close(h.waitCh)
 }

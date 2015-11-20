@@ -70,6 +70,8 @@ type Client struct {
 
 	logger *log.Logger
 
+	consulClient *ConsulClient
+
 	lastServer     net.Addr
 	lastRPCTime    time.Time
 	lastServerLock sync.Mutex
@@ -96,24 +98,27 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	// Create a logger
 	logger := log.New(cfg.LogOutput, "", log.LstdFlags)
 
+	// Create the consul client
+	consulAddr := cfg.ReadDefault("consul.address", "127.0.0.1:8500")
+	consulClient, err := NewConsulClient(logger, consulAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the consul client: %v", err)
+	}
+
 	// Create the client
 	c := &Client{
-		config:     cfg,
-		start:      time.Now(),
-		connPool:   nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
-		logger:     logger,
-		allocs:     make(map[string]*AllocRunner),
-		shutdownCh: make(chan struct{}),
+		config:       cfg,
+		start:        time.Now(),
+		consulClient: consulClient,
+		connPool:     nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
+		logger:       logger,
+		allocs:       make(map[string]*AllocRunner),
+		shutdownCh:   make(chan struct{}),
 	}
 
 	// Initialize the client
 	if err := c.init(); err != nil {
 		return nil, fmt.Errorf("failed intializing client: %v", err)
-	}
-
-	// Restore the state
-	if err := c.restoreState(); err != nil {
-		return nil, fmt.Errorf("failed to restore state: %v", err)
 	}
 
 	// Setup the node
@@ -134,8 +139,16 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	// Set up the known servers list
 	c.SetServers(c.config.Servers)
 
+	// Restore the state
+	if err := c.restoreState(); err != nil {
+		return nil, fmt.Errorf("failed to restore state: %v", err)
+	}
+
 	// Start the client!
 	go c.run()
+
+	// Start the consul client
+	go c.consulClient.SyncWithConsul()
 	return c, nil
 }
 
@@ -148,8 +161,15 @@ func (c *Client) init() error {
 			return fmt.Errorf("failed creating state dir: %s", err)
 		}
 
-		c.logger.Printf("[INFO] client: using state directory %v", c.config.StateDir)
+	} else {
+		// Othewise make a temp directory to use.
+		p, err := ioutil.TempDir("", "NomadClient")
+		if err != nil {
+			return fmt.Errorf("failed creating temporary directory for the StateDir: %v", err)
+		}
+		c.config.StateDir = p
 	}
+	c.logger.Printf("[INFO] client: using state directory %v", c.config.StateDir)
 
 	// Ensure the alloc dir exists if we have one
 	if c.config.AllocDir != "" {
@@ -192,6 +212,9 @@ func (c *Client) Shutdown() error {
 			<-ar.WaitCh()
 		}
 	}
+
+	// Stop the consul client
+	c.consulClient.ShutDown()
 
 	c.shutdown = true
 	close(c.shutdownCh)
@@ -328,11 +351,10 @@ func (c *Client) restoreState() error {
 	for _, entry := range list {
 		id := entry.Name()
 		alloc := &structs.Allocation{ID: id}
-		ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc)
+		ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulClient)
 		c.allocs[id] = ar
 		if err := ar.RestoreState(); err != nil {
-			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v",
-				id, err)
+			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v", id, err)
 			mErr.Errors = append(mErr.Errors, err)
 		} else {
 			go ar.Run()
@@ -743,7 +765,7 @@ func (c *Client) updateAlloc(exist, update *structs.Allocation) error {
 func (c *Client) addAlloc(alloc *structs.Allocation) error {
 	c.allocLock.Lock()
 	defer c.allocLock.Unlock()
-	ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc)
+	ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulClient)
 	c.allocs[alloc.ID] = ar
 	go ar.Run()
 	return nil

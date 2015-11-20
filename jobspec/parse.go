@@ -17,7 +17,7 @@ import (
 )
 
 var reDynamicPorts *regexp.Regexp = regexp.MustCompile("^[a-zA-Z0-9_]+$")
-var errDynamicPorts = fmt.Errorf("DynamicPort label does not conform to naming requirements %s", reDynamicPorts.String())
+var errPortLabel = fmt.Errorf("Port label does not conform to naming requirements %s", reDynamicPorts.String())
 
 // Parse parses the job spec from the given io.Reader.
 //
@@ -144,7 +144,7 @@ func parseJob(result *structs.Job, list *ast.ObjectList) error {
 	// If we have tasks outside, create TaskGroups for them
 	if o := listVal.Filter("task"); len(o.Items) > 0 {
 		var tasks []*structs.Task
-		if err := parseTasks(&tasks, o); err != nil {
+		if err := parseTasks(result.Name, "", &tasks, o); err != nil {
 			return err
 		}
 
@@ -247,7 +247,7 @@ func parseGroups(result *structs.Job, list *ast.ObjectList) error {
 
 		// Parse tasks
 		if o := listVal.Filter("task"); len(o.Items) > 0 {
-			if err := parseTasks(&g.Tasks, o); err != nil {
+			if err := parseTasks(result.Name, g.Name, &g.Tasks, o); err != nil {
 				return err
 			}
 		}
@@ -346,7 +346,7 @@ func parseConstraints(result *[]*structs.Constraint, list *ast.ObjectList) error
 	return nil
 }
 
-func parseTasks(result *[]*structs.Task, list *ast.ObjectList) error {
+func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, list *ast.ObjectList) error {
 	list = list.Children()
 	if len(list.Items) == 0 {
 		return nil
@@ -378,12 +378,16 @@ func parseTasks(result *[]*structs.Task, list *ast.ObjectList) error {
 		delete(m, "config")
 		delete(m, "env")
 		delete(m, "constraint")
+		delete(m, "service")
 		delete(m, "meta")
 		delete(m, "resources")
 
 		// Build the task
 		var t structs.Task
 		t.Name = n
+		if taskGroupName == "" {
+			taskGroupName = n
+		}
 		if err := mapstructure.WeakDecode(m, &t); err != nil {
 			return err
 		}
@@ -401,6 +405,12 @@ func parseTasks(result *[]*structs.Task, list *ast.ObjectList) error {
 			}
 		}
 
+		if o := listVal.Filter("service"); len(o.Items) > 0 {
+			if err := parseServices(jobName, taskGroupName, &t, o); err != nil {
+				return err
+			}
+		}
+
 		// If we have config, then parse that
 		if o := listVal.Filter("config"); len(o.Items) > 0 {
 			for _, o := range o.Elem().Items {
@@ -408,6 +418,7 @@ func parseTasks(result *[]*structs.Task, list *ast.ObjectList) error {
 				if err := hcl.DecodeObject(&m, o.Val); err != nil {
 					return err
 				}
+
 				if err := mapstructure.WeakDecode(m, &t.Config); err != nil {
 					return err
 				}
@@ -446,6 +457,79 @@ func parseTasks(result *[]*structs.Task, list *ast.ObjectList) error {
 		}
 
 		*result = append(*result, &t)
+	}
+
+	return nil
+}
+
+func parseServices(jobName string, taskGroupName string, task *structs.Task, serviceObjs *ast.ObjectList) error {
+	task.Services = make([]*structs.Service, len(serviceObjs.Items))
+	var defaultServiceName bool
+	for idx, o := range serviceObjs.Items {
+		var service structs.Service
+		var m map[string]interface{}
+		if err := hcl.DecodeObject(&m, o.Val); err != nil {
+			return err
+		}
+
+		delete(m, "check")
+
+		if err := mapstructure.WeakDecode(m, &service); err != nil {
+			return err
+		}
+
+		if defaultServiceName && service.Name == "" {
+			return fmt.Errorf("Only one service block may omit the Name field")
+		}
+
+		if service.Name == "" {
+			defaultServiceName = true
+			service.Name = fmt.Sprintf("%s-%s-%s", jobName, taskGroupName, task.Name)
+		} else {
+			service.Name = fmt.Sprintf("%s-%s-%s-%s", jobName, taskGroupName, task.Name, service.Name)
+		}
+
+		// Fileter checks
+		var checkList *ast.ObjectList
+		if ot, ok := o.Val.(*ast.ObjectType); ok {
+			checkList = ot.List
+		} else {
+			return fmt.Errorf("service '%s': should be an object", service.Name)
+		}
+
+		if co := checkList.Filter("check"); len(co.Items) > 0 {
+			if err := parseChecks(&service, co); err != nil {
+				return err
+			}
+		}
+
+		task.Services[idx] = &service
+	}
+
+	return nil
+}
+
+func parseChecks(service *structs.Service, checkObjs *ast.ObjectList) error {
+	service.Checks = make([]structs.ServiceCheck, len(checkObjs.Items))
+	for idx, co := range checkObjs.Items {
+		var check structs.ServiceCheck
+		var cm map[string]interface{}
+		if err := hcl.DecodeObject(&cm, co.Val); err != nil {
+			return err
+		}
+		dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+			DecodeHook:       mapstructure.StringToTimeDurationHookFunc(),
+			WeaklyTypedInput: true,
+			Result:           &check,
+		})
+		if err != nil {
+			return err
+		}
+		if err := dec.Decode(cm); err != nil {
+			return err
+		}
+
+		service.Checks[idx] = check
 	}
 
 	return nil
@@ -496,26 +580,50 @@ func parseResources(result *structs.Resources, list *ast.ObjectList) error {
 			return err
 		}
 
-		// Keep track of labels we've already seen so we can ensure there
-		// are no collisions when we turn them into environment variables.
-		// lowercase:NomalCase so we can get the first for the error message
-		seenLabel := map[string]string{}
-		for _, label := range r.DynamicPorts {
-			if !reDynamicPorts.MatchString(label) {
-				return errDynamicPorts
-			}
-			first, seen := seenLabel[strings.ToLower(label)]
-			if seen {
-				return fmt.Errorf("Found a port label collision: `%s` overlaps with previous `%s`", label, first)
-			} else {
-				seenLabel[strings.ToLower(label)] = label
-			}
-
+		var networkObj *ast.ObjectList
+		if ot, ok := o.Items[0].Val.(*ast.ObjectType); ok {
+			networkObj = ot.List
+		} else {
+			return fmt.Errorf("resource: should be an object")
+		}
+		if err := parsePorts(networkObj, &r); err != nil {
+			return err
 		}
 
 		result.Networks = []*structs.NetworkResource{&r}
 	}
 
+	return nil
+}
+
+func parsePorts(networkObj *ast.ObjectList, nw *structs.NetworkResource) error {
+	portsObjList := networkObj.Filter("port")
+	knownPortLabels := make(map[string]bool)
+	for _, port := range portsObjList.Items {
+		label := port.Keys[0].Token.Value().(string)
+		if !reDynamicPorts.MatchString(label) {
+			return errPortLabel
+		}
+		l := strings.ToLower(label)
+		if knownPortLabels[l] {
+			return fmt.Errorf("Found a port label collision: %s", label)
+		}
+		var p map[string]interface{}
+		var res structs.Port
+		if err := hcl.DecodeObject(&p, port.Val); err != nil {
+			return err
+		}
+		if err := mapstructure.WeakDecode(p, &res); err != nil {
+			return err
+		}
+		res.Label = label
+		if res.Value > 0 {
+			nw.ReservedPorts = append(nw.ReservedPorts, res)
+		} else {
+			nw.DynamicPorts = append(nw.DynamicPorts, res)
+		}
+		knownPortLabels[l] = true
+	}
 	return nil
 }
 

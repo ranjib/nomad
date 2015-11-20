@@ -36,27 +36,11 @@ job specification without needing to change your code. You can also schedule wor
 that accept dynamic resource allocations so they can scale down/up as your
 cluster gets more or less busy.
 
-### IPs and Named Ports
+### Networking
 
-Each task will receive port allocations on a single IP address. The IP is made
-available through `NOMAD_IP.`
+Nomad assigns IPs and ports to your jobs and exposes them via environment variables. See the [Networking](/docs/jobspec/networking.html) page for more details.
 
-If you requested reserved ports in your job specification and your task is successfully
-scheduled, these ports are available for your use. Ports from `reserved_ports`
-in the job spec are not exposed through the environment. If you requested
-dynamic ports in your job specification these are made known to your application via
-environment variables `NOMAD_PORT_{LABEL}`. For example
-`dynamic_ports = ["HTTP"]` becomes `NOMAD_PORT_HTTP`.
-
-Some drivers such as Docker and QEMU use port mapping. If a driver supports port
-mapping and you specify a numeric label, the label will be automatically used as
-the private port number. For example, `dynamic_ports = ["5000"]` will have a
-random port mapped to port 5000 inside the container or VM. These ports are also
-exported as environment variables for consistency, e.g. `NOMAD_PORT_5000`.
-
-Please see the relevant driver documentation for details.
-
-<a id="task_dir">### Task Directories</a>
+### Task Directories <a id="task_dir"></a>
 
 Nomad makes the following two directories available to tasks:
 

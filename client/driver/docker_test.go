@@ -11,6 +11,7 @@ import (
 	docker "github.com/fsouza/go-dockerclient"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/environment"
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -54,11 +55,11 @@ func dockerIsRemote(t *testing.T) bool {
 }
 
 func TestDockerDriver_Handle(t *testing.T) {
-	h := &dockerHandle{
+	h := &DockerHandle{
 		imageID:     "imageid",
 		containerID: "containerid",
 		doneCh:      make(chan struct{}),
-		waitCh:      make(chan error, 1),
+		waitCh:      make(chan *cstructs.WaitResult, 1),
 	}
 
 	actual := h.ID()
@@ -94,7 +95,7 @@ func TestDockerDriver_StartOpen_Wait(t *testing.T) {
 
 	task := &structs.Task{
 		Name: "redis-demo",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"image": "redis",
 		},
 		Resources: basicResources,
@@ -131,10 +132,10 @@ func TestDockerDriver_Start_Wait(t *testing.T) {
 
 	task := &structs.Task{
 		Name: "redis-demo",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"image":   "redis",
 			"command": "redis-server",
-			"args":    "-v",
+			"args":    []string{"-v"},
 		},
 		Resources: &structs.Resources{
 			MemoryMB: 256,
@@ -163,9 +164,9 @@ func TestDockerDriver_Start_Wait(t *testing.T) {
 	}
 
 	select {
-	case err := <-handle.WaitCh():
-		if err != nil {
-			t.Fatalf("err: %v", err)
+	case res := <-handle.WaitCh():
+		if !res.Successful() {
+			t.Fatalf("err: %v", res)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout")
@@ -184,10 +185,14 @@ func TestDockerDriver_Start_Wait_AllocDir(t *testing.T) {
 	file := "output.txt"
 	task := &structs.Task{
 		Name: "redis-demo",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"image":   "redis",
 			"command": "/bin/bash",
-			"args":    fmt.Sprintf(`-c "sleep 1; echo -n %s > $%s/%s"`, string(exp), environment.AllocDir, file),
+			"args": []string{
+				"-c",
+				fmt.Sprintf(`sleep 1; echo -n %s > $%s/%s`,
+					string(exp), environment.AllocDir, file),
+			},
 		},
 		Resources: &structs.Resources{
 			MemoryMB: 256,
@@ -210,9 +215,9 @@ func TestDockerDriver_Start_Wait_AllocDir(t *testing.T) {
 	defer handle.Kill()
 
 	select {
-	case err := <-handle.WaitCh():
-		if err != nil {
-			t.Fatalf("err: %v", err)
+	case res := <-handle.WaitCh():
+		if !res.Successful() {
+			t.Fatalf("err: %v", res)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout")
@@ -237,10 +242,10 @@ func TestDockerDriver_Start_Kill_Wait(t *testing.T) {
 
 	task := &structs.Task{
 		Name: "redis-demo",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"image":   "redis",
 			"command": "/bin/sleep",
-			"args":    "10",
+			"args":    []string{"10"},
 		},
 		Resources: basicResources,
 	}
@@ -268,9 +273,9 @@ func TestDockerDriver_Start_Kill_Wait(t *testing.T) {
 	}()
 
 	select {
-	case err := <-handle.WaitCh():
-		if err == nil {
-			t.Fatalf("should err: %v", err)
+	case res := <-handle.WaitCh():
+		if res.Successful() {
+			t.Fatalf("should err: %v", res)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("timeout")
@@ -280,7 +285,7 @@ func TestDockerDriver_Start_Kill_Wait(t *testing.T) {
 func taskTemplate() *structs.Task {
 	return &structs.Task{
 		Name: "redis-demo",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"image": "redis",
 		},
 		Resources: &structs.Resources{
@@ -289,8 +294,8 @@ func taskTemplate() *structs.Task {
 			Networks: []*structs.NetworkResource{
 				&structs.NetworkResource{
 					IP:            "127.0.0.1",
-					ReservedPorts: []int{11110},
-					DynamicPorts:  []string{"REDIS"},
+					ReservedPorts: []structs.Port{{"main", 11110}},
+					DynamicPorts:  []structs.Port{{"REDIS", 43330}},
 				},
 			},
 		},
@@ -303,13 +308,16 @@ func TestDocker_StartN(t *testing.T) {
 	}
 
 	task1 := taskTemplate()
-	task1.Resources.Networks[0].ReservedPorts[0] = 11111
+	task1.Resources.Networks[0].ReservedPorts[0] = structs.Port{"main", 11110}
+	task1.Resources.Networks[0].DynamicPorts[0] = structs.Port{"REDIS", 43331}
 
 	task2 := taskTemplate()
-	task2.Resources.Networks[0].ReservedPorts[0] = 22222
+	task2.Resources.Networks[0].ReservedPorts[0] = structs.Port{"main", 22222}
+	task2.Resources.Networks[0].DynamicPorts[0] = structs.Port{"REDIS", 43332}
 
 	task3 := taskTemplate()
-	task3.Resources.Networks[0].ReservedPorts[0] = 33333
+	task3.Resources.Networks[0].ReservedPorts[0] = structs.Port{"main", 33333}
+	task3.Resources.Networks[0].DynamicPorts[0] = structs.Port{"REDIS", 43333}
 
 	taskList := []*structs.Task{task1, task2, task3}
 
@@ -355,15 +363,18 @@ func TestDocker_StartNVersions(t *testing.T) {
 
 	task1 := taskTemplate()
 	task1.Config["image"] = "redis"
-	task1.Resources.Networks[0].ReservedPorts[0] = 11111
+	task1.Resources.Networks[0].ReservedPorts[0] = structs.Port{"main", 11110}
+	task1.Resources.Networks[0].DynamicPorts[0] = structs.Port{"REDIS", 43331}
 
 	task2 := taskTemplate()
 	task2.Config["image"] = "redis:latest"
-	task2.Resources.Networks[0].ReservedPorts[0] = 22222
+	task2.Resources.Networks[0].ReservedPorts[0] = structs.Port{"main", 22222}
+	task2.Resources.Networks[0].DynamicPorts[0] = structs.Port{"REDIS", 43332}
 
 	task3 := taskTemplate()
 	task3.Config["image"] = "redis:3.0"
-	task3.Resources.Networks[0].ReservedPorts[0] = 33333
+	task3.Resources.Networks[0].ReservedPorts[0] = structs.Port{"main", 33333}
+	task3.Resources.Networks[0].DynamicPorts[0] = structs.Port{"REDIS", 43333}
 
 	taskList := []*structs.Task{task1, task2, task3}
 
@@ -409,7 +420,7 @@ func TestDockerHostNet(t *testing.T) {
 
 	task := &structs.Task{
 		Name: "redis-demo",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"image":        "redis",
 			"network_mode": "host",
 		},
@@ -431,4 +442,93 @@ func TestDockerHostNet(t *testing.T) {
 		t.Fatalf("missing handle")
 	}
 	defer handle.Kill()
+}
+
+func TestDockerLabels(t *testing.T) {
+	if !dockerIsConnected(t) {
+		t.SkipNow()
+	}
+
+	task := taskTemplate()
+	task.Config["labels"] = []map[string]string{
+		map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+		},
+	}
+
+	driverCtx := testDockerDriverContext(task.Name)
+	ctx := testDriverExecContext(task, driverCtx)
+	defer ctx.AllocDir.Destroy()
+	d := NewDockerDriver(driverCtx)
+
+	handle, err := d.Start(ctx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("missing handle")
+	}
+	defer handle.Kill()
+
+	client, err := docker.NewClientFromEnv()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	container, err := client.InspectContainer(handle.(*DockerHandle).ContainerID())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if want, got := 2, len(container.Config.Labels); want != got {
+		t.Errorf("Wrong labels count for docker job. Expect: %d, got: %d", want, got)
+	}
+
+	if want, got := "value1", container.Config.Labels["label1"]; want != got {
+		t.Errorf("Wrong label value docker job. Expect: %s, got: %s", want, got)
+	}
+}
+
+func TestDockerDNS(t *testing.T) {
+	if !dockerIsConnected(t) {
+		t.SkipNow()
+	}
+
+	task := taskTemplate()
+	task.Config["dns_servers"] = []string{"8.8.8.8", "8.8.4.4"}
+	task.Config["dns_search_domains"] = []string{"example.com", "example.org", "example.net"}
+
+	driverCtx := testDockerDriverContext(task.Name)
+	ctx := testDriverExecContext(task, driverCtx)
+	defer ctx.AllocDir.Destroy()
+	d := NewDockerDriver(driverCtx)
+
+	handle, err := d.Start(ctx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("missing handle")
+	}
+	defer handle.Kill()
+
+	client, err := docker.NewClientFromEnv()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// don't know if is queriable in a clean way
+	container, err := client.InspectContainer(handle.(*DockerHandle).ContainerID())
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if !reflect.DeepEqual(task.Config["dns_servers"], container.HostConfig.DNS) {
+		t.Errorf("DNS Servers don't match.\nExpected:\n%s\nGot:\n%s\n", task.Config["dns_servers"], container.HostConfig.DNS)
+	}
+
+	if !reflect.DeepEqual(task.Config["dns_search_domains"], container.HostConfig.DNSSearch) {
+		t.Errorf("DNS Servers don't match.\nExpected:\n%s\nGot:\n%s\n", task.Config["dns_search_domains"], container.HostConfig.DNSSearch)
+	}
 }

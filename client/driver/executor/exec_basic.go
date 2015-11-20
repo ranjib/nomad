@@ -15,6 +15,8 @@ import (
 	"github.com/hashicorp/nomad/client/driver/environment"
 	"github.com/hashicorp/nomad/client/driver/spawn"
 	"github.com/hashicorp/nomad/nomad/structs"
+
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 )
 
 // BasicExecutor should work everywhere, and as a result does not include
@@ -27,7 +29,6 @@ type BasicExecutor struct {
 	allocDir string
 }
 
-// TODO: Have raw_exec use this as well.
 func NewBasicExecutor() Executor {
 	return &BasicExecutor{}
 }
@@ -61,12 +62,7 @@ func (e *BasicExecutor) Start() error {
 	}
 
 	e.cmd.Path = args.ReplaceEnv(e.cmd.Path, envVars.Map())
-	combined := strings.Join(e.cmd.Args, " ")
-	parsed, err := args.ParseAndReplace(combined, envVars.Map())
-	if err != nil {
-		return err
-	}
-	e.cmd.Args = parsed
+	e.cmd.Args = args.ParseAndReplace(e.cmd.Args, envVars.Map())
 
 	spawnState := filepath.Join(e.allocDir, fmt.Sprintf("%s_%s", e.taskName, "exit_status"))
 	e.spawn = spawn.NewSpawner(spawnState)
@@ -92,17 +88,8 @@ func (e *BasicExecutor) Open(id string) error {
 	return e.spawn.Valid()
 }
 
-func (e *BasicExecutor) Wait() error {
-	code, err := e.spawn.Wait()
-	if err != nil {
-		return err
-	}
-
-	if code != 0 {
-		return fmt.Errorf("Task exited with code: %d", code)
-	}
-
-	return nil
+func (e *BasicExecutor) Wait() *cstructs.WaitResult {
+	return e.spawn.Wait()
 }
 
 func (e *BasicExecutor) ID() (string, error) {

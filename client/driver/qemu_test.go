@@ -37,18 +37,21 @@ func TestQemuDriver_StartOpen_Wait(t *testing.T) {
 	// TODO: use test server to load from a fixture
 	task := &structs.Task{
 		Name: "linux",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"artifact_source": "https://dl.dropboxusercontent.com/u/47675/jar_thing/linux-0.2.img",
 			"checksum":        "sha256:a5e836985934c3392cbbd9b26db55a7d35a8d7ae1deb7ca559dd9c0159572544",
 			"accelerator":     "tcg",
-			"guest_ports":     "22,8080",
+			"port_map": []map[string]int{{
+				"main": 22,
+				"web":  8080,
+			}},
 		},
 		Resources: &structs.Resources{
 			CPU:      500,
 			MemoryMB: 512,
 			Networks: []*structs.NetworkResource{
 				&structs.NetworkResource{
-					ReservedPorts: []int{22000, 80},
+					ReservedPorts: []structs.Port{{"main", 22000}, {"web", 80}},
 				},
 			},
 		},
@@ -87,7 +90,7 @@ func TestQemuDriver_RequiresMemory(t *testing.T) {
 	// TODO: use test server to load from a fixture
 	task := &structs.Task{
 		Name: "linux",
-		Config: map[string]string{
+		Config: map[string]interface{}{
 			"artifact_source": "https://dl.dropboxusercontent.com/u/47675/jar_thing/linux-0.2.img",
 			"accelerator":     "tcg",
 			"host_port":       "8080",

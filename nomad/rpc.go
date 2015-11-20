@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/rpc"
 	"strings"
 	"time"
 
@@ -50,6 +51,18 @@ const (
 	// the requesting goroutine forever.
 	enqueueLimit = 30 * time.Second
 )
+
+// NewClientCodec returns a new rpc.ClientCodec to be used to make RPC calls to
+// the Nomad Server.
+func NewClientCodec(conn io.ReadWriteCloser) rpc.ClientCodec {
+	return msgpackrpc.NewCodecFromHandle(true, true, conn, structs.MsgpackHandle)
+}
+
+// NewServerCodec returns a new rpc.ServerCodec to be used by the Nomad Server
+// to handle rpcs.
+func NewServerCodec(conn io.ReadWriteCloser) rpc.ServerCodec {
+	return msgpackrpc.NewCodecFromHandle(true, true, conn, structs.MsgpackHandle)
+}
 
 // listen is used to listen for incoming RPC connections
 func (s *Server) listen() {
@@ -139,7 +152,7 @@ func (s *Server) handleMultiplex(conn net.Conn) {
 // handleNomadConn is used to service a single Nomad RPC connection
 func (s *Server) handleNomadConn(conn net.Conn) {
 	defer conn.Close()
-	rpcCodec := msgpackrpc.NewServerCodec(conn)
+	rpcCodec := NewServerCodec(conn)
 	for {
 		select {
 		case <-s.shutdownCh:

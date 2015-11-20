@@ -57,7 +57,7 @@ func TestParse(t *testing.T) {
 							&structs.Task{
 								Name:   "outside",
 								Driver: "java",
-								Config: map[string]string{
+								Config: map[string]interface{}{
 									"jar": "s3://my-cool-store/foo.jar",
 								},
 								Meta: map[string]string{
@@ -91,8 +91,25 @@ func TestParse(t *testing.T) {
 							&structs.Task{
 								Name:   "binstore",
 								Driver: "docker",
-								Config: map[string]string{
+								Config: map[string]interface{}{
 									"image": "hashicorp/binstore",
+								},
+								Services: []*structs.Service{
+									{
+										Id:        "",
+										Name:      "binstore-storagelocker-binsl-binstore",
+										Tags:      []string{"foo", "bar"},
+										PortLabel: "http",
+										Checks: []structs.ServiceCheck{
+											{
+												Id:       "",
+												Name:     "check-name",
+												Type:     "tcp",
+												Interval: 10 * time.Second,
+												Timeout:  2 * time.Second,
+											},
+										},
+									},
 								},
 								Env: map[string]string{
 									"HELLO": "world",
@@ -104,8 +121,8 @@ func TestParse(t *testing.T) {
 									Networks: []*structs.NetworkResource{
 										&structs.NetworkResource{
 											MBits:         100,
-											ReservedPorts: []int{1, 2, 3},
-											DynamicPorts:  []string{"http", "https", "admin"},
+											ReservedPorts: []structs.Port{{"one", 1}, {"two", 2}, {"three", 3}},
+											DynamicPorts:  []structs.Port{{"http", 0}, {"https", 0}, {"admin", 0}},
 										},
 									},
 								},
@@ -113,7 +130,7 @@ func TestParse(t *testing.T) {
 							&structs.Task{
 								Name:   "storagelocker",
 								Driver: "java",
-								Config: map[string]string{
+								Config: map[string]interface{}{
 									"image": "hashicorp/storagelocker",
 								},
 								Resources: &structs.Resources{
@@ -225,6 +242,43 @@ func TestParse(t *testing.T) {
 			},
 			false,
 		},
+
+		{
+			"task-nested-config.hcl",
+			&structs.Job{
+				Region:   "global",
+				ID:       "foo",
+				Name:     "foo",
+				Type:     "service",
+				Priority: 50,
+
+				TaskGroups: []*structs.TaskGroup{
+					&structs.TaskGroup{
+						Name:  "bar",
+						Count: 1,
+						RestartPolicy: &structs.RestartPolicy{
+							Attempts: 2,
+							Interval: 1 * time.Minute,
+							Delay:    15 * time.Second,
+						},
+						Tasks: []*structs.Task{
+							&structs.Task{
+								Name:   "bar",
+								Driver: "docker",
+								Config: map[string]interface{}{
+									"port_map": []map[string]interface{}{
+										map[string]interface{}{
+											"db": 1234,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -256,15 +310,15 @@ func TestBadPorts(t *testing.T) {
 
 	_, err = ParseFile(path)
 
-	if !strings.Contains(err.Error(), errDynamicPorts.Error()) {
-		t.Fatalf("\nExpected error\n  %s\ngot\n  %v", errDynamicPorts, err)
+	if !strings.Contains(err.Error(), errPortLabel.Error()) {
+		t.Fatalf("\nExpected error\n  %s\ngot\n  %v", errPortLabel, err)
 	}
 }
 
 func TestOverlappingPorts(t *testing.T) {
 	path, err := filepath.Abs(filepath.Join("./test-fixtures", "overlapping-ports.hcl"))
 	if err != nil {
-		t.Fatalf("Can't get absoluate path for file: %s", err)
+		t.Fatalf("Can't get absolute path for file: %s", err)
 	}
 
 	_, err = ParseFile(path)
@@ -274,6 +328,23 @@ func TestOverlappingPorts(t *testing.T) {
 	}
 
 	if !strings.Contains(err.Error(), "Found a port label collision") {
+		t.Fatalf("Expected collision error; got %v", err)
+	}
+}
+
+func TestIncompleteServiceDefn(t *testing.T) {
+	path, err := filepath.Abs(filepath.Join("./test-fixtures", "incorrect-service-def.hcl"))
+	if err != nil {
+		t.Fatalf("Can't get absolute path for file: %s", err)
+	}
+
+	_, err = ParseFile(path)
+
+	if err == nil {
+		t.Fatalf("Expected an error")
+	}
+
+	if !strings.Contains(err.Error(), "Only one service block may omit the Name field") {
 		t.Fatalf("Expected collision error; got %v", err)
 	}
 }

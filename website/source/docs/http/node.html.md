@@ -59,6 +59,7 @@ be specified using the `?region=` query parameter.
         "kernel.name": "darwin",
         "kernel.version": "14.4.0",
         "memory.totalbytes": "8589934592",
+        "network.ip-address": "127.0.0.1",
         "os.name": "darwin",
         "os.version": "14.4.0",
         "storage.bytesfree": "35888713728",
@@ -115,18 +116,193 @@ be specified using the `?region=` query parameter.
     ```javascript
     [
     {
-        "ID": "3575ba9d-7a12-0c96-7b28-add168c67984",
-        "EvalID": "151accaa-1ac6-90fe-d427-313e70ccbb88",
-        "Name": "binstore-storagelocker.binsl[0]",
-        "NodeID": "a703c3ca-5ff8-11e5-9213-970ee8879d1b",
-        "JobID": "binstore-storagelocker",
-        "TaskGroup": "binsl",
-        "DesiredStatus": "run",
-        "DesiredDescription": "",
-        "ClientStatus": "running",
-        "ClientDescription": "",
-        "CreateIndex": 16,
-        "ModifyIndex": 16
+      "ID": "203266e5-e0d6-9486-5e05-397ed2b184af",
+      "EvalID": "e68125ed-3fba-fb46-46cc-291addbc4455",
+      "Name": "example.cache[0]",
+      "NodeID": "e02b6169-83bd-9df6-69bd-832765f333eb",
+      "JobID": "example",
+      "ModifyIndex": 9,
+      "Resources": {
+        "Networks": [
+          {
+            "DynamicPorts": [
+              {
+                "Value": 20802,
+                "Label": "db"
+              }
+            ],
+            "ReservedPorts": null,
+            "MBits": 10,
+            "IP": "",
+            "CIDR": "",
+            "Device": ""
+          }
+        ],
+        "IOPS": 0,
+        "DiskMB": 0,
+        "MemoryMB": 256,
+        "CPU": 500
+      },
+      "TaskGroup": "cache",
+      "Job": {
+        "ModifyIndex": 5,
+        "CreateIndex": 5,
+        "StatusDescription": "",
+        "Status": "",
+        "Meta": null,
+        "Update": {
+          "MaxParallel": 1,
+          "Stagger": 1e+10
+        },
+        "TaskGroups": [
+          {
+            "Meta": null,
+            "Tasks": [
+              {
+                "Meta": null,
+                "Resources": {
+                  "Networks": [
+                    {
+                      "DynamicPorts": [
+                        {
+                          "Value": 20802,
+                          "Label": "db"
+                        }
+                      ],
+                      "ReservedPorts": null,
+                      "MBits": 0,
+                      "IP": "127.0.0.1",
+                      "CIDR": "",
+                      "Device": "lo"
+                    }
+                  ],
+                  "IOPS": 0,
+                  "DiskMB": 0,
+                  "MemoryMB": 256,
+                  "CPU": 500
+                },
+                "Constraints": null,
+                "Services": [
+                  {
+                    "Checks": [
+                      {
+                        "Timeout": 2e+09,
+                        "Interval": 1e+10,
+                        "Protocol": "",
+                        "Http": "",
+                        "Script": "",
+                        "Type": "tcp",
+                        "Name": "alive",
+                        "Id": ""
+                      }
+                    ],
+                    "PortLabel": "db",
+                    "Tags": [
+                      "global",
+                      "cache"
+                    ],
+                    "Name": "example-cache-redis",
+                    "Id": ""
+                  }
+                ],
+                "Env": null,
+                "Config": {
+                  "port_map": [
+                    {
+                      "db": 6379
+                    }
+                  ],
+                  "image": "redis:latest"
+                },
+                "Driver": "docker",
+                "Name": "redis"
+              }
+            ],
+            "RestartPolicy": {
+              "Delay": 2.5e+10,
+              "Interval": 3e+11,
+              "Attempts": 10
+            },
+            "Constraints": null,
+            "Count": 1,
+            "Name": "cache"
+          }
+        ],
+        "Region": "global",
+        "ID": "example",
+        "Name": "example",
+        "Type": "service",
+        "Priority": 50,
+        "AllAtOnce": false,
+        "Datacenters": [
+          "dc1"
+        ],
+        "Constraints": [
+          {
+            "Operand": "=",
+            "RTarget": "linux",
+            "LTarget": "$attr.kernel.name"
+          }
+        ]
+      },
+      "TaskResources": {
+        "redis": {
+          "Networks": [
+            {
+              "DynamicPorts": [
+                {
+                  "Value": 20802,
+                  "Label": "db"
+                }
+              ],
+              "ReservedPorts": null,
+              "MBits": 0,
+              "IP": "127.0.0.1",
+              "CIDR": "",
+              "Device": "lo"
+            }
+          ],
+          "IOPS": 0,
+          "DiskMB": 0,
+          "MemoryMB": 256,
+          "CPU": 500
+        }
+      },
+      "Metrics": {
+        "CoalescedFailures": 0,
+        "AllocationTime": 1590406,
+        "NodesEvaluated": 1,
+        "NodesFiltered": 0,
+        "ClassFiltered": null,
+        "ConstraintFiltered": null,
+        "NodesExhausted": 0,
+        "ClassExhausted": null,
+        "DimensionExhausted": null,
+        "Scores": {
+          "e02b6169-83bd-9df6-69bd-832765f333eb.binpack": 6.133651487695705
+        }
+      },
+      "DesiredStatus": "run",
+      "DesiredDescription": "",
+      "ClientStatus": "running",
+      "ClientDescription": "",
+      "TaskStates": {
+        "redis": {
+          "Events": [
+            {
+              "KillError": "",
+              "Message": "",
+              "Signal": 0,
+              "ExitCode": 0,
+              "DriverError": "",
+              "Time": 1447806038427841000,
+              "Type": "Started"
+            }
+          ],
+          "State": "running"
+        }
+      },
+      "CreateIndex": 7
     },
     ...
     ]

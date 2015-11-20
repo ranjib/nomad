@@ -6,16 +6,17 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/client/getter"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/mapstructure"
 )
 
 var (
@@ -30,10 +31,17 @@ type QemuDriver struct {
 	fingerprint.StaticFingerprinter
 }
 
+type QemuDriverConfig struct {
+	ArtifactSource string           `mapstructure:"artifact_source"`
+	Checksum       string           `mapstructure:"checksum"`
+	Accelerator    string           `mapstructure:"accelerator"`
+	PortMap        []map[string]int `mapstructure:"port_map"` // A map of host port labels and to guest ports.
+}
+
 // qemuHandle is returned from Start/Open as a handle to the PID
 type qemuHandle struct {
 	cmd    executor.Executor
-	waitCh chan error
+	waitCh chan *cstructs.WaitResult
 	doneCh chan struct{}
 }
 
@@ -69,6 +77,15 @@ func (d *QemuDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, 
 // Run an existing Qemu image. Start() will pull down an existing, valid Qemu
 // image and save it to the Drivers Allocation Dir
 func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+	var driverConfig QemuDriverConfig
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
+	}
+
+	if len(driverConfig.PortMap) > 1 {
+		return nil, fmt.Errorf("Only one port_map block is allowed in the qemu driver config")
+	}
+
 	// Get the image source
 	source, ok := task.Config["artifact_source"]
 	if !ok || source == "" {
@@ -90,8 +107,8 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	// Proceed to download an artifact to be executed.
 	vmPath, err := getter.GetArtifact(
 		filepath.Join(taskDir, allocdir.TaskLocal),
-		task.Config["artifact_source"],
-		task.Config["checksum"],
+		driverConfig.ArtifactSource,
+		driverConfig.Checksum,
 		d.logger,
 	)
 	if err != nil {
@@ -103,8 +120,8 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	// Parse configuration arguments
 	// Create the base arguments
 	accelerator := "tcg"
-	if acc, ok := task.Config["accelerator"]; ok {
-		accelerator = acc
+	if driverConfig.Accelerator != "" {
+		accelerator = driverConfig.Accelerator
 	}
 	// TODO: Check a lower bounds, e.g. the default 128 of Qemu
 	mem := fmt.Sprintf("%dM", task.Resources.MemoryMB)
@@ -125,42 +142,31 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	// the outside world to be able to reach it. VMs ran without port mappings can
 	// still reach out to the world, but without port mappings it is effectively
 	// firewalled
-	if len(task.Resources.Networks) > 0 {
-		// TODO: Consolidate these into map of host/guest port when we have HCL
-		// Note: Host port must be open and available
-		// Get and split guest ports. The guest_ports configuration must match up with
-		// the Reserved ports in the Task Resources
-		// Users can supply guest_hosts as a list of posts to map on the guest vm.
-		// These map 1:1 with the requested Reserved Ports from the hostmachine.
-		ports := strings.Split(task.Config["guest_ports"], ",")
-		if len(ports) == 0 {
-			return nil, fmt.Errorf("[ERR] driver.qemu: Error parsing required Guest Ports")
-		}
-
-		// TODO: support more than a single, default Network
-		if len(ports) != len(task.Resources.Networks[0].ReservedPorts) {
-			return nil, fmt.Errorf("[ERR] driver.qemu: Error matching Guest Ports with Reserved ports")
-		}
-
-		// Loop through the reserved ports and construct the hostfwd string, to map
+	protocols := []string{"udp", "tcp"}
+	if len(task.Resources.Networks) > 0 && len(driverConfig.PortMap) == 1 {
+		// Loop through the port map and construct the hostfwd string, to map
 		// reserved ports to the ports listenting in the VM
-		// Ex:
-		//    hostfwd=tcp::22000-:22,hostfwd=tcp::80-:8080
-		reservedPorts := task.Resources.Networks[0].ReservedPorts
-		var forwarding string
-		for i, p := range ports {
-			forwarding = fmt.Sprintf("%s,hostfwd=tcp::%s-:%s", forwarding, strconv.Itoa(reservedPorts[i]), p)
+		// Ex: hostfwd=tcp::22000-:22,hostfwd=tcp::80-:8080
+		var forwarding []string
+		taskPorts := task.Resources.Networks[0].MapLabelToValues()
+		for label, guest := range driverConfig.PortMap[0] {
+			host, ok := taskPorts[label]
+			if !ok {
+				return nil, fmt.Errorf("Unknown port label %q", label)
+			}
+
+			for _, p := range protocols {
+				forwarding = append(forwarding, fmt.Sprintf("hostfwd=%s::%d-:%d", p, host, guest))
+			}
 		}
 
-		if "" == forwarding {
-			return nil, fmt.Errorf("[ERR] driver.qemu:  Error constructing port forwarding")
+		if len(forwarding) != 0 {
+			args = append(args,
+				"-netdev",
+				fmt.Sprintf("user,id=user.0%s", strings.Join(forwarding, ",")),
+				"-device", "virtio-net,netdev=user.0",
+			)
 		}
-
-		args = append(args,
-			"-netdev",
-			fmt.Sprintf("user,id=user.0%s", forwarding),
-			"-device", "virtio-net,netdev=user.0",
-		)
 	}
 
 	// If using KVM, add optimization args
@@ -193,7 +199,7 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	h := &qemuHandle{
 		cmd:    cmd,
 		doneCh: make(chan struct{}),
-		waitCh: make(chan error, 1),
+		waitCh: make(chan *cstructs.WaitResult, 1),
 	}
 
 	go h.run()
@@ -211,7 +217,7 @@ func (d *QemuDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 	h := &execHandle{
 		cmd:    cmd,
 		doneCh: make(chan struct{}),
-		waitCh: make(chan error, 1),
+		waitCh: make(chan *cstructs.WaitResult, 1),
 	}
 	go h.run()
 	return h, nil
@@ -222,7 +228,7 @@ func (h *qemuHandle) ID() string {
 	return id
 }
 
-func (h *qemuHandle) WaitCh() chan error {
+func (h *qemuHandle) WaitCh() chan *cstructs.WaitResult {
 	return h.waitCh
 }
 
@@ -244,10 +250,8 @@ func (h *qemuHandle) Kill() error {
 }
 
 func (h *qemuHandle) run() {
-	err := h.cmd.Wait()
+	res := h.cmd.Wait()
 	close(h.doneCh)
-	if err != nil {
-		h.waitCh <- err
-	}
+	h.waitCh <- res
 	close(h.waitCh)
 }

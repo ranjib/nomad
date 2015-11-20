@@ -20,6 +20,28 @@ func NewRestartPolicy() *RestartPolicy {
 	}
 }
 
+// The ServiceCheck data model represents the consul health check that
+// Nomad registers for a Task
+type ServiceCheck struct {
+	Id       string
+	Name     string
+	Type     string
+	Script   string
+	Path     string
+	Protocol string
+	Interval time.Duration
+	Timeout  time.Duration
+}
+
+// The Service model represents a Consul service defintion
+type Service struct {
+	Id        string
+	Name      string
+	Tags      []string
+	PortLabel string `mapstructure:"port"`
+	Checks    []ServiceCheck
+}
+
 // TaskGroup is the unit of scheduling.
 type TaskGroup struct {
 	Name          string
@@ -65,9 +87,10 @@ func (g *TaskGroup) AddTask(t *Task) *TaskGroup {
 type Task struct {
 	Name        string
 	Driver      string
-	Config      map[string]string
+	Config      map[string]interface{}
 	Constraints []*Constraint
 	Env         map[string]string
+	Services    []Service
 	Resources   *Resources
 	Meta        map[string]string
 }
@@ -84,7 +107,7 @@ func NewTask(name, driver string) *Task {
 // the task.
 func (t *Task) SetConfig(key, val string) *Task {
 	if t.Config == nil {
-		t.Config = make(map[string]string)
+		t.Config = make(map[string]interface{})
 	}
 	t.Config[key] = val
 	return t
@@ -109,4 +132,30 @@ func (t *Task) Require(r *Resources) *Task {
 func (t *Task) Constrain(c *Constraint) *Task {
 	t.Constraints = append(t.Constraints, c)
 	return t
+}
+
+// TaskState tracks the current state of a task and events that caused state
+// transistions.
+type TaskState struct {
+	State  string
+	Events []*TaskEvent
+}
+
+const (
+	TaskDriverFailure = "Driver Failure"
+	TaskStarted       = "Started"
+	TaskTerminated    = "Terminated"
+	TaskKilled        = "Killed"
+)
+
+// TaskEvent is an event that effects the state of a task and contains meta-data
+// appropriate to the events type.
+type TaskEvent struct {
+	Type        string
+	Time        int64
+	DriverError string
+	ExitCode    int
+	Signal      int
+	Message     string
+	KillError   string
 }

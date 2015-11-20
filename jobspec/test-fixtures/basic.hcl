@@ -45,14 +45,34 @@ job "binstore-storagelocker" {
               HELLO = "world"
               LOREM = "ipsum"
             }
+            service {
+                tags = ["foo", "bar"]
+                port = "http"
+                check {
+                    name = "check-name"
+                    type = "tcp"
+                    interval = "10s"
+                    timeout = "2s"
+                }
+            }
             resources {
                 cpu = 500
                 memory = 128
 
                 network {
                     mbits = "100"
-                    reserved_ports = [1,2,3]
-                    dynamic_ports = ["http", "https", "admin"]
+                    port "one" {
+                        static = 1
+                    }
+                    port "two" {
+                        static = 2
+                    }
+                    port "three" {
+                        static = 3
+                    }
+                    port "http" {}
+                    port "https" {}
+                    port "admin" {}
                 }
             }
         }
