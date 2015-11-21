@@ -185,7 +185,6 @@ func (h *lxcHandle) Kill() error {
 			}
 		} else {
 			h.logger.Println("[WARN] Container is not running. Skipping stop call")
-
 		}
 		if err := c.Destroy(); err != nil {
 			h.logger.Printf("[WARN] Failed to destroy container %s", err)
@@ -199,5 +198,6 @@ func (h *lxcHandle) Kill() error {
 }
 
 func (h *lxcHandle) Update(task *structs.Task) error {
-	return fmt.Errorf("Update is not supported by lxc driver")
+	h.logger.Warnf("Update is not supported by lxc driver")
+	return nil
 }
