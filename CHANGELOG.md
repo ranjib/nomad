@@ -1,4 +1,19 @@
-## 0.2.0
+## 0.2.1 (UNRELEASED)
+
+IMPROVEMENTS:
+
+  * core: Can specify a whitelist for activating drivers [GH-467]
+  * client/spawn: spawn package tests made portable (work on Windows) [GH-442]
+  * driver/docker: Added TLS client options to the config file [GH-480]
+
+BUG FIXES:
+
+  * driver/docker: Expose the container port instead of the host port [GH-466]
+  * driver/docker: Support `port_map` for static ports [GH-476]
+  * driver/docker: Pass 0.2.0-style port environment variables to the docker container [GH-476]
+  * client/service discovery: Make Service IDs unique [GH-479]
+
+## 0.2.0 (November 18, 2015)
 
 BACKWARDS INCOMPATIBILITIES:
 
