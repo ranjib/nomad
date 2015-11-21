@@ -198,6 +198,6 @@ func (h *lxcHandle) Kill() error {
 }
 
 func (h *lxcHandle) Update(task *structs.Task) error {
-	h.logger.Warnf("Update is not supported by lxc driver")
+	h.logger.Printf("[WARN] Update is not supported by lxc driver")
 	return nil
 }
