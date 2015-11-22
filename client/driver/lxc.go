@@ -9,6 +9,7 @@ import (
 	"github.com/mitchellh/mapstructure"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 	"log"
+	"time"
 )
 
 type LXCDriver struct {
@@ -27,10 +28,11 @@ type LXCDriverConfig struct {
 }
 
 type lxcHandle struct {
-	logger *log.Logger
-	Name   string
-	waitCh chan *cstructs.WaitResult
-	doneCh chan struct{}
+	logger    *log.Logger
+	Name      string
+	waitCh    chan *cstructs.WaitResult
+	doneCh    chan struct{}
+	container *lxc.Container
 }
 
 func NewLXCDriver(ctx *DriverContext) Driver {
@@ -77,12 +79,27 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, err
 	}
 	h := &lxcHandle{
-		Name:   driverConfig.Name,
-		logger: d.logger,
-		doneCh: make(chan struct{}),
-		waitCh: make(chan *cstructs.WaitResult, 1),
+		Name:      driverConfig.Name,
+		logger:    d.logger,
+		doneCh:    make(chan struct{}),
+		waitCh:    make(chan *cstructs.WaitResult, 1),
+		container: container,
 	}
+	go h.run()
 	return h, nil
+}
+
+func (h *lxcHandle) run() {
+	for {
+		if h.container.Running() {
+			time.Sleep(5 * time.Second)
+		} else {
+			h.waitCh <- cstructs.NewWaitResult(0, 0, nil)
+			close(h.waitCh)
+			close(h.doneCh)
+			return
+		}
+	}
 }
 
 func (d *LXCDriver) createByCloning(config LXCDriverConfig) (*lxc.Container, error) {
@@ -151,10 +168,11 @@ func (d *LXCDriver) Open(ctx *ExecContext, name string) (DriverHandle, error) {
 		return nil, err
 	}
 	h := &lxcHandle{
-		Name:   name,
-		logger: d.logger,
-		doneCh: make(chan struct{}),
-		waitCh: make(chan *cstructs.WaitResult, 1),
+		Name:      name,
+		logger:    d.logger,
+		doneCh:    make(chan struct{}),
+		waitCh:    make(chan *cstructs.WaitResult, 1),
+		container: c,
 	}
 	if err := c.Start(); err != nil {
 		return nil, err
@@ -163,7 +181,7 @@ func (d *LXCDriver) Open(ctx *ExecContext, name string) (DriverHandle, error) {
 }
 
 func (h *lxcHandle) ID() string {
-	return h.Name
+	return fmt.Sprintf("LXC:%s", h.Name)
 }
 
 func (h *lxcHandle) WaitCh() chan *cstructs.WaitResult {
