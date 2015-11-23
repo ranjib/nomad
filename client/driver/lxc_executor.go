@@ -10,11 +10,6 @@ import (
 	"time"
 )
 
-type LXCExecutor struct {
-	logger    *log.Logger
-	container *lxc.Container
-}
-
 type LXCExecutorConfig struct {
 	LXCPath   string `mapstructure:"lxc_path"`
 	Name      string `mapstructure:"name"`
@@ -25,7 +20,27 @@ type LXCExecutorConfig struct {
 	Arch      string `mapstructure:"arch"`
 }
 
-func (config *LXCExecutorConfig) createFromTemplate() (*lxc.Container, error) {
+type LXCExecutor struct {
+	logger    *log.Logger
+	container *lxc.Container
+	config    *LXCExecutorConfig
+}
+
+func NewLXCExecutor(config *LXCExecutorConfig, logger *log.Logger) (*LXCExecutor, error) {
+	container, err := CreateLXCContainer(config)
+	if err != nil {
+		logger.Printf("[ERROR] failed to create container: %s", err)
+		return nil, err
+	}
+	executor := LXCExecutor{
+		config:    config,
+		container: container,
+		logger:    logger,
+	}
+	return &executor, nil
+}
+
+func createFromTemplate(config *LXCExecutorConfig) (*lxc.Container, error) {
 	if config.Template == "" {
 		return nil, fmt.Errorf("Missing template name for lxc driver")
 	}
@@ -56,7 +71,7 @@ func (config *LXCExecutorConfig) createFromTemplate() (*lxc.Container, error) {
 	return c, nil
 }
 
-func (config *LXCExecutorConfig) createByCloning() (*lxc.Container, error) {
+func createByCloning(config *LXCExecutorConfig) (*lxc.Container, error) {
 	c, err := lxc.NewContainer(config.CloneFrom, config.LXCPath)
 	if err != nil {
 		return nil, err
@@ -71,7 +86,7 @@ func (config *LXCExecutorConfig) createByCloning() (*lxc.Container, error) {
 	return c1, nil
 }
 
-func (config *LXCExecutorConfig) Create() (*lxc.Container, error) {
+func CreateLXCContainer(config *LXCExecutorConfig) (*lxc.Container, error) {
 	if config.LXCPath == "" {
 		config.LXCPath = lxc.DefaultConfigPath()
 	}
@@ -80,22 +95,19 @@ func (config *LXCExecutorConfig) Create() (*lxc.Container, error) {
 	}
 	var container *lxc.Container
 	if config.CloneFrom == "" {
-		c, err := config.createFromTemplate()
+		c, err := createFromTemplate(config)
 		if err != nil {
 			return nil, err
 		}
 		container = c
 	} else {
-		c, err := config.createByCloning()
+		c, err := createByCloning(config)
 		if err != nil {
 			return nil, err
 		}
 		container = c
 	}
 	return container, nil
-}
-
-func (e *LXCExecutor) SetCommand() {
 }
 
 func (e *LXCExecutor) Wait() *cstructs.WaitResult {
