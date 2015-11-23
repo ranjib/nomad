@@ -9,7 +9,6 @@ import (
 	"github.com/mitchellh/mapstructure"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 	"log"
-	"time"
 )
 
 type LXCDriver struct {
@@ -17,22 +16,12 @@ type LXCDriver struct {
 	fingerprint.StaticFingerprinter
 }
 
-type LXCDriverConfig struct {
-	LXCPath   string `mapstructure:"lxc_path"`
-	Name      string `mapstructure:"name"`
-	CloneFrom string `mapstructure:"clone_from"`
-	Template  string `mapstructure:"template"`
-	Distro    string `mapstructure:"distro"`
-	Release   string `mapstructure:"release"`
-	Arch      string `mapstructure:"arch"`
-}
-
 type lxcHandle struct {
-	logger    *log.Logger
-	Name      string
-	waitCh    chan *cstructs.WaitResult
-	doneCh    chan struct{}
-	container *lxc.Container
+	logger   *log.Logger
+	Name     string
+	waitCh   chan *cstructs.WaitResult
+	doneCh   chan struct{}
+	executor *LXCExecutor
 }
 
 func NewLXCDriver(ctx *DriverContext) Driver {
@@ -47,135 +36,57 @@ func (d *LXCDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	var driverConfig LXCDriverConfig
-	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+	var config LXCExecutorConfig
+	if err := mapstructure.WeakDecode(task.Config, &config); err != nil {
 		return nil, err
 	}
-	if driverConfig.LXCPath == "" {
-		driverConfig.LXCPath = lxc.DefaultConfigPath()
+	d.logger.Printf("[DEBUG] Using lxc name: %s", config.Name)
+	container, e := config.Create()
+	if e != nil {
+		d.logger.Printf("[ERROR] failed to create container: %s", e)
+		return nil, e
 	}
-	d.logger.Printf("[DEBUG] Using lxcpath: %s", driverConfig.LXCPath)
-	if driverConfig.Name == "" {
-		return nil, fmt.Errorf("Missing container name for lxc driver")
+	d.logger.Printf("[DEBUG] Successfully created container: %s", config.Name)
+	h := &lxcHandle{
+		Name:     config.Name,
+		logger:   d.logger,
+		doneCh:   make(chan struct{}),
+		waitCh:   make(chan *cstructs.WaitResult, 1),
+		executor: &LXCExecutor{container: container},
+	}
+	if err := h.executor.Limit(task.Resources); err != nil {
+		d.logger.Printf("[WARN] Failed to set resource constraints %s", err)
+		return nil, err
 	}
 
-	var container *lxc.Container
-	if driverConfig.CloneFrom == "" {
-		c, err := d.createFromTemplate(driverConfig)
-		if err != nil {
-			return nil, err
-		}
-		container = c
-	} else {
-		c, err := d.createByCloning(driverConfig)
-		if err != nil {
-			return nil, err
-		}
-		container = c
-	}
-	d.logger.Printf("[DEBUG] Using lxc name: %s", driverConfig.Name)
-	if err := container.Start(); err != nil {
+	if err := h.executor.Start(); err != nil {
 		d.logger.Printf("[WARN] Failed to start container %s", err)
 		return nil, err
-	}
-	h := &lxcHandle{
-		Name:      driverConfig.Name,
-		logger:    d.logger,
-		doneCh:    make(chan struct{}),
-		waitCh:    make(chan *cstructs.WaitResult, 1),
-		container: container,
 	}
 	go h.run()
 	return h, nil
 }
 
 func (h *lxcHandle) run() {
-	for {
-		if h.container.Running() {
-			time.Sleep(5 * time.Second)
-		} else {
-			h.waitCh <- cstructs.NewWaitResult(0, 0, nil)
-			close(h.waitCh)
-			close(h.doneCh)
-			return
-		}
-	}
-}
-
-func (d *LXCDriver) createByCloning(config LXCDriverConfig) (*lxc.Container, error) {
-	c, err := lxc.NewContainer(config.CloneFrom, config.LXCPath)
-	if err != nil {
-		d.logger.Printf("[WARN] Failed to initialize container object %s", err)
-		return nil, err
-	}
-	if err := c.Clone(config.Name, lxc.DefaultCloneOptions); err != nil {
-		return nil, err
-	}
-	c1, err1 := lxc.NewContainer(config.Name, config.LXCPath)
-	if err1 != nil {
-		d.logger.Printf("[WARN] Failed to initialize container object %s", err1)
-		return nil, err1
-	}
-	return c1, nil
-}
-
-func (d *LXCDriver) createFromTemplate(config LXCDriverConfig) (*lxc.Container, error) {
-	if config.Template == "" {
-		return nil, fmt.Errorf("Missing template name for lxc driver")
-	}
-	d.logger.Printf("[DEBUG] Using lxc template: %s", config.Template)
-	if config.Distro == "" {
-		return nil, fmt.Errorf("Missing distro name for lxc driver")
-	}
-	d.logger.Printf("[DEBUG] Using lxc templare option, distro: %s", config.Distro)
-	if config.Release == "" {
-		return nil, fmt.Errorf("Missing release name for lxc driver")
-	}
-	d.logger.Printf("[DEBUG] Using lxc templare option, release: %s", config.Release)
-	if config.Arch == "" {
-		return nil, fmt.Errorf("Missing arch name for lxc driver")
-	}
-	d.logger.Printf("[DEBUG] Using lxc templare option, arch: %s", config.Arch)
-	options := lxc.TemplateOptions{
-		Template:             config.Template,
-		Distro:               config.Distro,
-		Release:              config.Release,
-		Arch:                 config.Arch,
-		FlushCache:           false,
-		DisableGPGValidation: false,
-	}
-	c, err := lxc.NewContainer(config.Name, config.LXCPath)
-	if err != nil {
-		d.logger.Printf("[WARN] Failed to initialize container object %s", err)
-		return nil, err
-	}
-	if err := c.Create(options); err != nil {
-		d.logger.Printf("[WARN] Failed to create container %s", err)
-		return nil, err
-	}
-	return c, nil
+	waitResult := h.executor.Wait()
+	close(h.doneCh)
+	h.waitCh <- waitResult
+	close(h.waitCh)
 }
 
 func (d *LXCDriver) Open(ctx *ExecContext, name string) (DriverHandle, error) {
 	lxcpath := lxc.DefaultConfigPath()
 	c, err := lxc.NewContainer(name, lxcpath)
 	if err != nil {
-		d.logger.Printf("[WARN] Failed to start container %s", err)
-		return nil, err
-	}
-	if err := c.Start(); err != nil {
-		d.logger.Printf("[WARN] Failed to start container %s", err)
+		d.logger.Printf("[WARN] Failed to initialize container %s", err)
 		return nil, err
 	}
 	h := &lxcHandle{
-		Name:      name,
-		logger:    d.logger,
-		doneCh:    make(chan struct{}),
-		waitCh:    make(chan *cstructs.WaitResult, 1),
-		container: c,
-	}
-	if err := c.Start(); err != nil {
-		return nil, err
+		Name:     name,
+		logger:   d.logger,
+		doneCh:   make(chan struct{}),
+		waitCh:   make(chan *cstructs.WaitResult, 1),
+		executor: &LXCExecutor{container: c},
 	}
 	return h, nil
 }
@@ -189,30 +100,7 @@ func (h *lxcHandle) WaitCh() chan *cstructs.WaitResult {
 }
 
 func (h *lxcHandle) Kill() error {
-	lxcpath := lxc.DefaultConfigPath()
-	c, err := lxc.NewContainer(h.Name, lxcpath)
-	if err != nil {
-		h.logger.Printf("[WARN] Failed to initialize container %s", err)
-		return err
-	}
-	if c.Defined() {
-		if c.State() == lxc.RUNNING {
-			if err := c.Stop(); err != nil {
-				h.logger.Printf("[WARN] Failed to stop container %s", err)
-				return err
-			}
-		} else {
-			h.logger.Println("[WARN] Container is not running. Skipping stop call")
-		}
-		if err := c.Destroy(); err != nil {
-			h.logger.Printf("[WARN] Failed to destroy container %s", err)
-			return err
-		}
-	} else {
-		h.logger.Println("[WARN] Cant kill non-existent container")
-	}
-
-	return nil
+	return h.executor.Shutdown()
 }
 
 func (h *lxcHandle) Update(task *structs.Task) error {
