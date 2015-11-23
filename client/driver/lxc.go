@@ -41,6 +41,7 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, err
 	}
 	d.logger.Printf("[DEBUG] Using lxc name: %s", config.Name)
+	//envVars := TaskEnvironmentVariables(ctx, task)
 	container, e := config.Create()
 	if e != nil {
 		d.logger.Printf("[ERROR] failed to create container: %s", e)
@@ -48,12 +49,16 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	}
 	d.logger.Printf("[DEBUG] Successfully created container: %s", config.Name)
 	h := &lxcHandle{
-		Name:     config.Name,
-		logger:   d.logger,
-		doneCh:   make(chan struct{}),
-		waitCh:   make(chan *cstructs.WaitResult, 1),
-		executor: &LXCExecutor{container: container},
+		Name:   config.Name,
+		logger: d.logger,
+		doneCh: make(chan struct{}),
+		waitCh: make(chan *cstructs.WaitResult, 1),
+		executor: &LXCExecutor{
+			container: container,
+			logger:    d.logger,
+		},
 	}
+
 	if err := h.executor.Limit(task.Resources); err != nil {
 		d.logger.Printf("[WARN] Failed to set resource constraints %s", err)
 		return nil, err
@@ -82,11 +87,14 @@ func (d *LXCDriver) Open(ctx *ExecContext, name string) (DriverHandle, error) {
 		return nil, err
 	}
 	h := &lxcHandle{
-		Name:     name,
-		logger:   d.logger,
-		doneCh:   make(chan struct{}),
-		waitCh:   make(chan *cstructs.WaitResult, 1),
-		executor: &LXCExecutor{container: c},
+		Name:   name,
+		logger: d.logger,
+		doneCh: make(chan struct{}),
+		waitCh: make(chan *cstructs.WaitResult, 1),
+		executor: &LXCExecutor{
+			container: c,
+			logger:    d.logger,
+		},
 	}
 	return h, nil
 }

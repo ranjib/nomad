@@ -5,10 +5,13 @@ import (
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 	lxc "gopkg.in/lxc/go-lxc.v2"
+	"log"
+	"strconv"
 	"time"
 )
 
 type LXCExecutor struct {
+	logger    *log.Logger
 	container *lxc.Container
 }
 
@@ -107,6 +110,27 @@ func (e *LXCExecutor) Wait() *cstructs.WaitResult {
 }
 
 func (e *LXCExecutor) Limit(resources *structs.Resources) error {
+	if resources.MemoryMB > 0 {
+		limit := strconv.Itoa(resources.MemoryMB) + "M"
+		if err := e.container.SetConfigItem("lxc.cgroup.memory.limit_in_bytes", limit); err != nil {
+			e.logger.Printf("[ERROR] failed to set memory limit to %s. Error: %v", limit, err)
+			return err
+		}
+	}
+	if resources.CPU > 2 {
+		limit := strconv.Itoa(resources.CPU)
+		if err := e.container.SetConfigItem("lxc.cgroup.cpu.shares", limit); err != nil {
+			e.logger.Printf("[ERROR] failed to set cpu limit to %s. Error: %v", limit, err)
+			return err
+		}
+	}
+	if resources.IOPS > 0 {
+		limit := strconv.Itoa(resources.IOPS)
+		if err := e.container.SetConfigItem("lxc.cgroup.blkio.weight", limit); err != nil {
+			e.logger.Printf("[ERROR] failed to set iops limit to %s. Error: %v", limit, err)
+			return err
+		}
+	}
 	return nil
 }
 
