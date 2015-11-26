@@ -25,7 +25,7 @@ type TaskRunner struct {
 	ctx            *driver.ExecContext
 	allocID        string
 	restartTracker restartTracker
-	consulClient   *ConsulClient
+	consulService  *ConsulService
 
 	task     *structs.Task
 	state    *structs.TaskState
@@ -53,14 +53,14 @@ type TaskStateUpdater func(taskName string)
 func NewTaskRunner(logger *log.Logger, config *config.Config,
 	updater TaskStateUpdater, ctx *driver.ExecContext,
 	allocID string, task *structs.Task, state *structs.TaskState,
-	restartTracker restartTracker, consulClient *ConsulClient) *TaskRunner {
+	restartTracker restartTracker, consulService *ConsulService) *TaskRunner {
 
 	tc := &TaskRunner{
 		config:         config,
 		updater:        updater,
 		logger:         logger,
 		restartTracker: restartTracker,
-		consulClient:   consulClient,
+		consulService:  consulService,
 		ctx:            ctx,
 		allocID:        allocID,
 		task:           task,
@@ -234,10 +234,10 @@ func (r *TaskRunner) run() {
 		destroyed := false
 
 		// Register the services defined by the task with Consil
-		r.consulClient.Register(r.task, r.allocID)
+		r.consulService.Register(r.task, r.allocID)
 
 		// De-Register the services belonging to the task from consul
-		defer r.consulClient.Deregister(r.task)
+		defer r.consulService.Deregister(r.task, r.allocID)
 
 	OUTER:
 		// Wait for updates
@@ -250,10 +250,6 @@ func (r *TaskRunner) run() {
 				r.task = update
 				if err := r.handle.Update(update); err != nil {
 					r.logger.Printf("[ERR] client: failed to update task '%s' for alloc '%s': %v", r.task.Name, r.allocID, err)
-				}
-
-				if err := r.consulClient.Register(update, r.allocID); err != nil {
-					r.logger.Printf("[ERR] client: failed to update service definition: %v", err)
 				}
 			case <-r.destroyCh:
 				// Avoid destroying twice
@@ -284,8 +280,8 @@ func (r *TaskRunner) run() {
 		}
 
 		// Check if we should restart. If not mark task as dead and exit.
+		shouldRestart, when := r.restartTracker.nextRestart(waitRes.ExitCode)
 		waitEvent := r.waitErrorToEvent(waitRes)
-		shouldRestart, when := r.restartTracker.nextRestart()
 		if !shouldRestart {
 			r.logger.Printf("[INFO] client: Not restarting task: %v for alloc: %v ", r.task.Name, r.allocID)
 			r.setState(structs.TaskStateDead, waitEvent)

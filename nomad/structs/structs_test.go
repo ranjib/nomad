@@ -362,7 +362,7 @@ func TestInvalidServiceCheck(t *testing.T) {
 		Id:        "service-id",
 		Name:      "service-name",
 		PortLabel: "bar",
-		Checks: []ServiceCheck{
+		Checks: []*ServiceCheck{
 			{
 
 				Id:   "check-id",
@@ -374,4 +374,38 @@ func TestInvalidServiceCheck(t *testing.T) {
 	if err := s.Validate(); err == nil {
 		t.Fatalf("Service should be invalid")
 	}
+}
+
+func TestDistinctCheckId(t *testing.T) {
+	c1 := ServiceCheck{
+		Name:     "web-health",
+		Type:     "http",
+		Path:     "/health",
+		Interval: 2 * time.Second,
+		Timeout:  3 * time.Second,
+	}
+	c2 := ServiceCheck{
+		Name:     "web-health",
+		Type:     "http",
+		Path:     "/health1",
+		Interval: 2 * time.Second,
+		Timeout:  3 * time.Second,
+	}
+
+	c3 := ServiceCheck{
+		Name:     "web-health",
+		Type:     "http",
+		Path:     "/health",
+		Interval: 4 * time.Second,
+		Timeout:  3 * time.Second,
+	}
+	serviceId := "123"
+	c1Hash := c1.Hash(serviceId)
+	c2Hash := c2.Hash(serviceId)
+	c3Hash := c3.Hash(serviceId)
+
+	if c1Hash == c2Hash || c1Hash == c3Hash || c3Hash == c2Hash {
+		t.Fatalf("Checks need to be uniq c1: %s, c2: %s, c3: %s", c1Hash, c2Hash, c3Hash)
+	}
+
 }

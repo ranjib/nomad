@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -10,9 +9,16 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/client/allocdir"
+	"github.com/hashicorp/nomad/helper/testtask"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
+
+func TestMain(m *testing.M) {
+	if !testtask.Run() {
+		os.Exit(m.Run())
+	}
+}
 
 var (
 	constraint = &structs.Resources{
@@ -45,9 +51,10 @@ func testExecutor(t *testing.T, buildExecutor func() Executor, compatible func(*
 	}
 
 	command := func(name string, args ...string) Executor {
-		b := buildExecutor()
-		SetCommand(b, name, args)
-		return b
+		e := buildExecutor()
+		SetCommand(e, name, args)
+		testtask.SetCmdEnv(e.Command())
+		return e
 	}
 
 	Executor_Start_Invalid(t, command)
@@ -55,6 +62,7 @@ func testExecutor(t *testing.T, buildExecutor func() Executor, compatible func(*
 	Executor_Start_Wait(t, command)
 	Executor_Start_Kill(t, command)
 	Executor_Open(t, command, buildExecutor)
+	Executor_Open_Invalid(t, command, buildExecutor)
 }
 
 type buildExecCommand func(name string, args ...string) Executor
@@ -79,7 +87,7 @@ func Executor_Start_Invalid(t *testing.T, command buildExecCommand) {
 }
 
 func Executor_Start_Wait_Failure_Code(t *testing.T, command buildExecCommand) {
-	e := command("/bin/date", "-invalid")
+	e := command(testtask.Path(), "fail")
 
 	if err := e.Limit(constraint); err != nil {
 		log.Panicf("Limit() failed: %v", err)
@@ -112,8 +120,7 @@ func Executor_Start_Wait(t *testing.T, command buildExecCommand) {
 	expected := "hello world"
 	file := filepath.Join(allocdir.TaskLocal, "output.txt")
 	absFilePath := filepath.Join(taskDir, file)
-	cmd := fmt.Sprintf(`/bin/sleep 1 ; echo -n %v > %v`, expected, file)
-	e := command("/bin/bash", "-c", cmd)
+	e := command(testtask.Path(), "sleep", "1s", "write", expected, file)
 
 	if err := e.Limit(constraint); err != nil {
 		log.Panicf("Limit() failed: %v", err)
@@ -152,7 +159,7 @@ func Executor_Start_Kill(t *testing.T, command buildExecCommand) {
 	}
 
 	filePath := filepath.Join(taskDir, "output")
-	e := command("/bin/bash", "-c", "sleep 1 ; echo \"failure\" > "+filePath)
+	e := command(testtask.Path(), "sleep", "1s", "write", "failure", filePath)
 
 	if err := e.Limit(constraint); err != nil {
 		log.Panicf("Limit() failed: %v", err)
@@ -190,8 +197,7 @@ func Executor_Open(t *testing.T, command buildExecCommand, newExecutor func() Ex
 	expected := "hello world"
 	file := filepath.Join(allocdir.TaskLocal, "output.txt")
 	absFilePath := filepath.Join(taskDir, file)
-	cmd := fmt.Sprintf(`/bin/sleep 1 ; echo -n %v > %v`, expected, file)
-	e := command("/bin/bash", "-c", cmd)
+	e := command(testtask.Path(), "sleep", "1s", "write", expected, file)
 
 	if err := e.Limit(constraint); err != nil {
 		log.Panicf("Limit() failed: %v", err)
@@ -232,7 +238,7 @@ func Executor_Open(t *testing.T, command buildExecCommand, newExecutor func() Ex
 
 func Executor_Open_Invalid(t *testing.T, command buildExecCommand, newExecutor func() Executor) {
 	task, alloc := mockAllocDir(t)
-	e := command("echo", "foo")
+	e := command(testtask.Path(), "echo", "foo")
 
 	if err := e.Limit(constraint); err != nil {
 		log.Panicf("Limit() failed: %v", err)
@@ -251,8 +257,19 @@ func Executor_Open_Invalid(t *testing.T, command buildExecCommand, newExecutor f
 		log.Panicf("ID() failed: %v", err)
 	}
 
+	// Kill the task because some OSes (windows) will not let us destroy the
+	// alloc (below) if the task is still running.
+	if err := e.ForceStop(); err != nil {
+		log.Panicf("e.ForceStop() failed: %v", err)
+	}
+
+	// Wait until process is actually gone, we don't care what the result was.
+	e.Wait()
+
 	// Destroy the allocdir which removes the exit code.
-	alloc.Destroy()
+	if err := alloc.Destroy(); err != nil {
+		log.Panicf("alloc.Destroy() failed: %v", err)
+	}
 
 	e2 := newExecutor()
 	if err := e2.Open(id); err == nil {

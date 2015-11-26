@@ -1,9 +1,12 @@
 package client
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,55 +19,125 @@ const (
 	syncInterval = 5 * time.Second
 )
 
-type trackedService struct {
-	allocId string
+// consulApi is the interface which wraps the actual consul api client
+type consulApi interface {
+	CheckRegister(check *consul.AgentCheckRegistration) error
+	CheckDeregister(checkID string) error
+	ServiceRegister(service *consul.AgentServiceRegistration) error
+	ServiceDeregister(ServiceID string) error
+	Services() (map[string]*consul.AgentService, error)
+	Checks() (map[string]*consul.AgentCheck, error)
+}
+
+// consulApiClient is the actual implementation of the consulApi which
+// talks to the consul agent
+type consulApiClient struct {
+	client *consul.Client
+}
+
+func (a *consulApiClient) CheckRegister(check *consul.AgentCheckRegistration) error {
+	return a.client.Agent().CheckRegister(check)
+}
+
+func (a *consulApiClient) CheckDeregister(checkID string) error {
+	return a.client.Agent().CheckDeregister(checkID)
+}
+
+func (a *consulApiClient) ServiceRegister(service *consul.AgentServiceRegistration) error {
+	return a.client.Agent().ServiceRegister(service)
+}
+
+func (a *consulApiClient) ServiceDeregister(serviceId string) error {
+	return a.client.Agent().ServiceDeregister(serviceId)
+}
+
+func (a *consulApiClient) Services() (map[string]*consul.AgentService, error) {
+	return a.client.Agent().Services()
+}
+
+func (a *consulApiClient) Checks() (map[string]*consul.AgentCheck, error) {
+	return a.client.Agent().Checks()
+}
+
+// trackedTask is a Task that we are tracking for changes in service and check
+// definitions and keep them sycned with Consul Agent
+type trackedTask struct {
+	allocID string
 	task    *structs.Task
-	service *structs.Service
 }
 
-func (t *trackedService) IsServiceValid() bool {
-	for _, service := range t.task.Services {
-		if service.Id == t.service.Id {
-			return true
-		}
-	}
-
-	return false
-}
-
-type ConsulClient struct {
-	client     *consul.Client
+// ConsulService is the service which tracks tasks and syncs the services and
+// checks defined in them with Consul Agent
+type ConsulService struct {
+	client     consulApi
 	logger     *log.Logger
 	shutdownCh chan struct{}
 
-	trackedServices map[string]*trackedService // Service ID to Tracked Service Map
-	trackedSrvLock  sync.Mutex
+	trackedTasks   map[string]*trackedTask
+	serviceStates  map[string]string
+	trackedTskLock sync.Mutex
 }
 
-func NewConsulClient(logger *log.Logger, consulAddr string) (*ConsulClient, error) {
+// A factory method to create new consul service
+func NewConsulService(logger *log.Logger, consulAddr string, token string,
+	auth string, enableSSL bool, verifySSL bool) (*ConsulService, error) {
 	var err error
 	var c *consul.Client
 	cfg := consul.DefaultConfig()
 	cfg.Address = consulAddr
+	if token != "" {
+		cfg.Token = token
+	}
+
+	if auth != "" {
+		var username, password string
+		if strings.Contains(auth, ":") {
+			split := strings.SplitN(auth, ":", 2)
+			username = split[0]
+			password = split[1]
+		} else {
+			username = auth
+		}
+
+		cfg.HttpAuth = &consul.HttpBasicAuth{
+			Username: username,
+			Password: password,
+		}
+	}
+	if enableSSL {
+		cfg.Scheme = "https"
+	}
+	if enableSSL && !verifySSL {
+		cfg.HttpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+
+	}
 	if c, err = consul.NewClient(cfg); err != nil {
 		return nil, err
 	}
 
-	consulClient := ConsulClient{
-		client:          c,
-		logger:          logger,
-		trackedServices: make(map[string]*trackedService),
-		shutdownCh:      make(chan struct{}),
+	consulService := ConsulService{
+		client:        &consulApiClient{client: c},
+		logger:        logger,
+		trackedTasks:  make(map[string]*trackedTask),
+		serviceStates: make(map[string]string),
+		shutdownCh:    make(chan struct{}),
 	}
 
-	return &consulClient, nil
+	return &consulService, nil
 }
 
-func (c *ConsulClient) Register(task *structs.Task, allocID string) error {
-	// Removing the service first so that we can re-sync everything cleanly
-	c.Deregister(task)
-
+// Register starts tracking a task for changes to it's services and tasks and
+// adds/removes services and checks associated with it.
+func (c *ConsulService) Register(task *structs.Task, allocID string) error {
 	var mErr multierror.Error
+	c.trackedTskLock.Lock()
+	tt := &trackedTask{allocID: allocID, task: task}
+	c.trackedTasks[fmt.Sprintf("%s-%s", allocID, task.Name)] = tt
+	c.trackedTskLock.Unlock()
 	for _, service := range task.Services {
 		c.logger.Printf("[INFO] consul: Registering service %s with Consul.", service.Name)
 		if err := c.registerService(service, task, allocID); err != nil {
@@ -75,78 +148,39 @@ func (c *ConsulClient) Register(task *structs.Task, allocID string) error {
 	return mErr.ErrorOrNil()
 }
 
-func (c *ConsulClient) Deregister(task *structs.Task) error {
+// Deregister stops tracking a task for changes to it's services and checks and
+// removes all the services and checks associated with the Task
+func (c *ConsulService) Deregister(task *structs.Task, allocID string) error {
 	var mErr multierror.Error
+	c.trackedTskLock.Lock()
+	delete(c.trackedTasks, fmt.Sprintf("%s-%s", allocID, task.Name))
+	c.trackedTskLock.Unlock()
 	for _, service := range task.Services {
 		if service.Id == "" {
 			continue
 		}
 		c.logger.Printf("[INFO] consul: De-Registering service %v with Consul", service.Name)
 		if err := c.deregisterService(service.Id); err != nil {
-			c.logger.Printf("[ERROR] consul: Error in de-registering service %v from Consul", service.Name)
+			c.logger.Printf("[DEBUG] consul: Error in de-registering service %v from Consul", service.Name)
 			mErr.Errors = append(mErr.Errors, err)
 		}
 	}
 	return mErr.ErrorOrNil()
 }
 
-func (c *ConsulClient) ShutDown() {
+func (c *ConsulService) ShutDown() {
 	close(c.shutdownCh)
 }
 
-func (c *ConsulClient) findPortAndHostForLabel(portLabel string, task *structs.Task) (string, int) {
-	for _, network := range task.Resources.Networks {
-		if p, ok := network.MapLabelToValues(nil)[portLabel]; ok {
-			return network.IP, p
-		}
-	}
-	return "", 0
-}
-
-func (c *ConsulClient) SyncWithConsul() {
+// SyncWithConsul is a long lived function that performs calls to sync
+// checks and services periodically with Consul Agent
+func (c *ConsulService) SyncWithConsul() {
 	sync := time.After(syncInterval)
-	agent := c.client.Agent()
 
 	for {
 		select {
 		case <-sync:
-			var consulServices map[string]*consul.AgentService
-			var err error
-
-			for serviceId, ts := range c.trackedServices {
-				if !ts.IsServiceValid() {
-					c.logger.Printf("[INFO] consul: Removing service: %s since the task doesn't have it anymore", ts.service.Name)
-					c.deregisterService(serviceId)
-				}
-			}
-
-			// Get the list of the services that Consul knows about
-			if consulServices, err = agent.Services(); err != nil {
-				c.logger.Printf("[DEBUG] consul: Error while syncing services with Consul: %v", err)
-				continue
-			}
-
-			// See if we have services that Consul doesn't know about yet.
-			// Register with Consul the services which are not registered
-			for serviceId := range c.trackedServices {
-				if _, ok := consulServices[serviceId]; !ok {
-					ts := c.trackedServices[serviceId]
-					c.registerService(ts.service, ts.task, ts.allocId)
-				}
-			}
-
-			// See if consul thinks we have some services which are not running
-			// anymore on the node. We de-register those services
-			for serviceId := range consulServices {
-				if serviceId == "consul" {
-					continue
-				}
-				if _, ok := c.trackedServices[serviceId]; !ok {
-					if err := c.deregisterService(serviceId); err != nil {
-						c.logger.Printf("[DEBUG] consul: Error while de-registering service with ID: %s", serviceId)
-					}
-				}
-			}
+			c.performSync()
 			sync = time.After(syncInterval)
 		case <-c.shutdownCh:
 			c.logger.Printf("[INFO] Shutting down Consul Client")
@@ -155,73 +189,153 @@ func (c *ConsulClient) SyncWithConsul() {
 	}
 }
 
-func (c *ConsulClient) registerService(service *structs.Service, task *structs.Task, allocID string) error {
+// performSync syncs checks and services with Consul and removed tracked
+// services which are no longer present in tasks
+func (c *ConsulService) performSync() {
+	// Get the list of the services and that Consul knows about
+	consulServices, _ := c.client.Services()
+	consulChecks, _ := c.client.Checks()
+	delete(consulServices, "consul")
+
+	knownChecks := make(map[string]struct{})
+	knownServices := make(map[string]struct{})
+
+	// Add services and checks which Consul doesn't know about
+	for _, trackedTask := range c.trackedTasks {
+		for _, service := range trackedTask.task.Services {
+
+			// Add new services which Consul agent isn't aware of
+			knownServices[service.Id] = struct{}{}
+			if _, ok := consulServices[service.Id]; !ok {
+				c.registerService(service, trackedTask.task, trackedTask.allocID)
+				continue
+			}
+
+			// If a service has changed, re-register it with Consul agent
+			if service.Hash() != c.serviceStates[service.Id] {
+				c.registerService(service, trackedTask.task, trackedTask.allocID)
+				continue
+			}
+
+			// Add new checks that Consul isn't aware of
+			for _, check := range service.Checks {
+				knownChecks[check.Id] = struct{}{}
+				if _, ok := consulChecks[check.Id]; !ok {
+					host, port := trackedTask.task.FindHostAndPortFor(service.PortLabel)
+					cr := c.makeCheck(service, check, host, port)
+					c.registerCheck(cr)
+				}
+			}
+		}
+	}
+
+	// Remove services from the service tracker which no longer exists
+	for serviceId := range c.serviceStates {
+		if _, ok := knownServices[serviceId]; !ok {
+			delete(c.serviceStates, serviceId)
+		}
+	}
+
+	// Remove services that are not present anymore
+	for _, consulService := range consulServices {
+		if _, ok := knownServices[consulService.ID]; !ok {
+			delete(c.serviceStates, consulService.ID)
+			c.deregisterService(consulService.ID)
+		}
+	}
+
+	// Remove checks that are not present anymore
+	for _, consulCheck := range consulChecks {
+		if _, ok := knownChecks[consulCheck.CheckID]; !ok {
+			c.deregisterCheck(consulCheck.CheckID)
+		}
+	}
+}
+
+// registerService registers a Service with Consul
+func (c *ConsulService) registerService(service *structs.Service, task *structs.Task, allocID string) error {
 	var mErr multierror.Error
 	service.Id = fmt.Sprintf("%s-%s", allocID, service.Name)
-	host, port := c.findPortAndHostForLabel(service.PortLabel, task)
+	host, port := task.FindHostAndPortFor(service.PortLabel)
 	if host == "" || port == 0 {
 		return fmt.Errorf("consul: The port:%s marked for registration of service: %s couldn't be found", service.PortLabel, service.Name)
 	}
-	checks := c.makeChecks(service, host, port)
+	c.serviceStates[service.Id] = service.Hash()
+
 	asr := &consul.AgentServiceRegistration{
 		ID:      service.Id,
 		Name:    service.Name,
 		Tags:    service.Tags,
 		Port:    port,
 		Address: host,
-		Checks:  checks,
 	}
-	ts := &trackedService{
-		allocId: allocID,
-		task:    task,
-		service: service,
-	}
-	c.trackedSrvLock.Lock()
-	c.trackedServices[service.Id] = ts
-	c.trackedSrvLock.Unlock()
 
-	if err := c.client.Agent().ServiceRegister(asr); err != nil {
-		c.logger.Printf("[ERROR] consul: Error while registering service %v with Consul: %v", service.Name, err)
+	if err := c.client.ServiceRegister(asr); err != nil {
+		c.logger.Printf("[DEBUG] consul: Error while registering service %v with Consul: %v", service.Name, err)
 		mErr.Errors = append(mErr.Errors, err)
+	}
+	for _, check := range service.Checks {
+		cr := c.makeCheck(service, check, host, port)
+		if err := c.registerCheck(cr); err != nil {
+			c.logger.Printf("[ERROR] consul: Error while registerting check %v with Consul: %v", check.Name, err)
+			mErr.Errors = append(mErr.Errors, err)
+		}
+
 	}
 	return mErr.ErrorOrNil()
 }
 
-func (c *ConsulClient) deregisterService(serviceId string) error {
-	c.trackedSrvLock.Lock()
-	delete(c.trackedServices, serviceId)
-	c.trackedSrvLock.Unlock()
+// registerCheck registers a check with Consul
+func (c *ConsulService) registerCheck(check *consul.AgentCheckRegistration) error {
+	c.logger.Printf("[DEBUG] Registering Check with ID: %v for Service: %v", check.ID, check.ServiceID)
+	return c.client.CheckRegister(check)
+}
 
-	if err := c.client.Agent().ServiceDeregister(serviceId); err != nil {
+// deregisterCheck de-registers a check with a specific ID from Consul
+func (c *ConsulService) deregisterCheck(checkID string) error {
+	c.logger.Printf("[DEBUG] Removing check with ID: %v", checkID)
+	return c.client.CheckDeregister(checkID)
+}
+
+// deregisterService de-registers a Service with a specific id from Consul
+func (c *ConsulService) deregisterService(serviceId string) error {
+	delete(c.serviceStates, serviceId)
+	if err := c.client.ServiceDeregister(serviceId); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *ConsulClient) makeChecks(service *structs.Service, ip string, port int) []*consul.AgentServiceCheck {
-	var checks []*consul.AgentServiceCheck
-	for _, check := range service.Checks {
-		c := &consul.AgentServiceCheck{
-			Interval: check.Interval.String(),
-			Timeout:  check.Timeout.String(),
-		}
-		switch check.Type {
-		case structs.ServiceCheckHTTP:
-			if check.Protocol == "" {
-				check.Protocol = "http"
-			}
-			url := url.URL{
-				Scheme: check.Protocol,
-				Host:   fmt.Sprintf("%s:%d", ip, port),
-				Path:   check.Path,
-			}
-			c.HTTP = url.String()
-		case structs.ServiceCheckTCP:
-			c.TCP = fmt.Sprintf("%s:%d", ip, port)
-		case structs.ServiceCheckScript:
-			c.Script = check.Script // TODO This needs to include the path of the alloc dir and based on driver types
-		}
-		checks = append(checks, c)
+// makeCheck creates a Consul Check Registration struct
+func (c *ConsulService) makeCheck(service *structs.Service, check *structs.ServiceCheck, ip string, port int) *consul.AgentCheckRegistration {
+	if check.Name == "" {
+		check.Name = fmt.Sprintf("service: %q%s%q check", service.Name)
 	}
-	return checks
+	check.Id = check.Hash(service.Id)
+
+	cr := &consul.AgentCheckRegistration{
+		ID:        check.Id,
+		Name:      check.Name,
+		ServiceID: service.Id,
+	}
+	cr.Interval = check.Interval.String()
+	cr.Timeout = check.Timeout.String()
+
+	switch check.Type {
+	case structs.ServiceCheckHTTP:
+		if check.Protocol == "" {
+			check.Protocol = "http"
+		}
+		url := url.URL{
+			Scheme: check.Protocol,
+			Host:   fmt.Sprintf("%s:%d", ip, port),
+			Path:   check.Path,
+		}
+		cr.HTTP = url.String()
+	case structs.ServiceCheckTCP:
+		cr.TCP = fmt.Sprintf("%s:%d", ip, port)
+	case structs.ServiceCheckScript:
+		cr.Script = check.Script // TODO This needs to include the path of the alloc dir and based on driver types
+	}
+	return cr
 }

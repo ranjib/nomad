@@ -3,8 +3,13 @@
 IMPROVEMENTS:
 
   * core: Can specify a whitelist for activating drivers [GH-467]
+  * core: Can specify a whitelist for activating fingerprinters [GH-488]
   * client/spawn: spawn package tests made portable (work on Windows) [GH-442]
+  * client/executor: executor package tests made portable (work on Windows) [GH-497]
+  * client/driver: driver package tests made portable (work on windows) [GH-502]
   * driver/docker: Added TLS client options to the config file [GH-480]
+  * core/api: Can list all known regions in the cluster [GH-495]
+  * client/discovery: Added more consul client api configuration options [GH-503]
 
 BUG FIXES:
 
@@ -12,6 +17,11 @@ BUG FIXES:
   * driver/docker: Support `port_map` for static ports [GH-476]
   * driver/docker: Pass 0.2.0-style port environment variables to the docker container [GH-476]
   * client/service discovery: Make Service IDs unique [GH-479]
+  * client/restart policy: Not restarting Batch Jobs if the exit code is 0 [GH-491]
+  * core: Shared reference to DynamicPorts caused port conflicts when scheduling
+    count > 1 [GH-494]
+  * distinct_hosts constraint can be specified as a boolean (previously panicked) [GH-501]
+  * client/service: Fixes update to check definitions and services which are already registered [GH-498]
 
 ## 0.2.0 (November 18, 2015)
 

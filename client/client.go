@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -71,7 +70,7 @@ type Client struct {
 
 	logger *log.Logger
 
-	consulClient *ConsulClient
+	consulService *ConsulService
 
 	lastServer     net.Addr
 	lastRPCTime    time.Time
@@ -99,22 +98,19 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	// Create a logger
 	logger := log.New(cfg.LogOutput, "", log.LstdFlags)
 
-	// Create the consul client
-	consulAddr := cfg.ReadDefault("consul.address", "127.0.0.1:8500")
-	consulClient, err := NewConsulClient(logger, consulAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create the consul client: %v", err)
-	}
-
 	// Create the client
 	c := &Client{
-		config:       cfg,
-		start:        time.Now(),
-		consulClient: consulClient,
-		connPool:     nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
-		logger:       logger,
-		allocs:       make(map[string]*AllocRunner),
-		shutdownCh:   make(chan struct{}),
+		config:     cfg,
+		start:      time.Now(),
+		connPool:   nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
+		logger:     logger,
+		allocs:     make(map[string]*AllocRunner),
+		shutdownCh: make(chan struct{}),
+	}
+
+	// Setup the Consul Service
+	if err := c.setupConsulService(); err != nil {
+		return nil, fmt.Errorf("failed to create the consul service: %v", err)
 	}
 
 	// Initialize the client
@@ -148,9 +144,24 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	// Start the client!
 	go c.run()
 
-	// Start the consul client
-	go c.consulClient.SyncWithConsul()
+	// Start the consul service
+	go c.consulService.SyncWithConsul()
 	return c, nil
+}
+
+func (c *Client) setupConsulService() error {
+	var consulService *ConsulService
+	var err error
+	addr := c.config.ReadDefault("consul.address", "127.0.0.1:8500")
+	token := c.config.Read("consul.token")
+	auth := c.config.Read("consul.auth")
+	enableSSL := c.config.ReadBoolDefault("consul.ssl", false)
+	verifySSL := c.config.ReadBoolDefault("consul.verifyssl", false)
+	if consulService, err = NewConsulService(c.logger, addr, token, auth, enableSSL, verifySSL); err != nil {
+		return err
+	}
+	c.consulService = consulService
+	return nil
 }
 
 // init is used to initialize the client and perform any setup
@@ -214,8 +225,8 @@ func (c *Client) Shutdown() error {
 		}
 	}
 
-	// Stop the consul client
-	c.consulClient.ShutDown()
+	// Stop the consul service
+	c.consulService.ShutDown()
 
 	c.shutdown = true
 	close(c.shutdownCh)
@@ -352,7 +363,7 @@ func (c *Client) restoreState() error {
 	for _, entry := range list {
 		id := entry.Name()
 		alloc := &structs.Allocation{ID: id}
-		ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulClient)
+		ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulService)
 		c.allocs[id] = ar
 		if err := ar.RestoreState(); err != nil {
 			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v", id, err)
@@ -453,8 +464,17 @@ func (c *Client) setupNode() error {
 
 // fingerprint is used to fingerprint the client and setup the node
 func (c *Client) fingerprint() error {
+	whitelist := c.config.ReadStringListToMap("fingerprint.whitelist")
+	whitelistEnabled := len(whitelist) > 0
+
 	var applied []string
+	var skipped []string
 	for _, name := range fingerprint.BuiltinFingerprints {
+		// Skip modules that are not in the whitelist if it is enabled.
+		if _, ok := whitelist[name]; whitelistEnabled && !ok {
+			skipped = append(skipped, name)
+			continue
+		}
 		f, err := fingerprint.NewFingerprint(name, c.logger)
 		if err != nil {
 			return err
@@ -475,6 +495,9 @@ func (c *Client) fingerprint() error {
 		}
 	}
 	c.logger.Printf("[DEBUG] client: applied fingerprints %v", applied)
+	if len(skipped) != 0 {
+		c.logger.Printf("[DEBUG] client: fingerprint modules skipped due to whitelist: %v", skipped)
+	}
 	return nil
 }
 
@@ -496,14 +519,7 @@ func (c *Client) fingerprintPeriodic(name string, f fingerprint.Fingerprint, d t
 // setupDrivers is used to find the available drivers
 func (c *Client) setupDrivers() error {
 	// Build the whitelist of drivers.
-	userWhitelist := strings.TrimSpace(c.config.ReadDefault("driver.whitelist", ""))
-	whitelist := make(map[string]struct{})
-	if userWhitelist != "" {
-		for _, driver := range strings.Split(userWhitelist, ",") {
-			trimmed := strings.TrimSpace(driver)
-			whitelist[trimmed] = struct{}{}
-		}
-	}
+	whitelist := c.config.ReadStringListToMap("driver.whitelist")
 	whitelistEnabled := len(whitelist) > 0
 
 	var avail []string
@@ -791,7 +807,7 @@ func (c *Client) updateAlloc(exist, update *structs.Allocation) error {
 func (c *Client) addAlloc(alloc *structs.Allocation) error {
 	c.allocLock.Lock()
 	defer c.allocLock.Unlock()
-	ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulClient)
+	ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulService)
 	c.allocs[alloc.ID] = ar
 	go ar.Run()
 	return nil
