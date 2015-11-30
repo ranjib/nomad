@@ -26,6 +26,10 @@ type LXCExecutor struct {
 	config    *LXCExecutorConfig
 }
 
+func (e *LXCExecutor) Container() *lxc.Container {
+	return e.container
+}
+
 func NewLXCExecutor(config *LXCExecutorConfig, logger *log.Logger) (*LXCExecutor, error) {
 	container, err := CreateLXCContainer(config)
 	if err != nil {

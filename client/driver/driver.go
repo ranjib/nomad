@@ -20,11 +20,12 @@ import (
 var BuiltinDrivers = map[string]Factory{
 	"docker":   NewDockerDriver,
 	"exec":     NewExecDriver,
-	"raw_exec": NewRawExecDriver,
+	"gypsy":    NewGypsyDriver,
 	"java":     NewJavaDriver,
-	"qemu":     NewQemuDriver,
-	"rkt":      NewRktDriver,
 	"lxc":      NewLXCDriver,
+	"qemu":     NewQemuDriver,
+	"raw_exec": NewRawExecDriver,
+	"rkt":      NewRktDriver,
 	"systemd":  NewSystemdDriver,
 }
 
