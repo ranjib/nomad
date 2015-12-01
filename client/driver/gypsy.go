@@ -19,19 +19,21 @@ type GypsyDriver struct {
 }
 
 type GypsyConfig struct {
+	ServerURL string `mapstructure:"server_url"`
 	Container string `mapstructure:"container"`
 	Pipeline  string `mapstructure:"pipeline"`
 	RunId     int    `mapstructure:"run_id"`
 }
 
 type gypsyHandle struct {
-	logger   *log.Logger
-	Id       string
-	waitCh   chan *cstructs.WaitResult
-	doneCh   chan struct{}
-	executor *LXCExecutor
-	Pipeline string
-	RunId    int
+	logger    *log.Logger
+	Id        string
+	waitCh    chan *cstructs.WaitResult
+	doneCh    chan struct{}
+	executor  *LXCExecutor
+	Pipeline  string
+	RunId     int
+	ServerURL string
 }
 
 func NewGypsyDriver(ctx *DriverContext) Driver {
@@ -62,14 +64,21 @@ func (d *GypsyDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, e
 	}
 	d.logger.Printf("[DEBUG] Successfully created container: %s", lxcConfig.Name)
+	var gypsyServerURL string
+	if config.ServerURL == "" {
+		gypsyServerURL = "http://127.0.0.1:5678"
+	} else {
+		gypsyServerURL = config.ServerURL
+	}
 	h := &gypsyHandle{
-		Id:       ctx.AllocID,
-		logger:   d.logger,
-		doneCh:   make(chan struct{}),
-		waitCh:   make(chan *cstructs.WaitResult, 1),
-		executor: executor,
-		Pipeline: config.Pipeline,
-		RunId:    config.RunId,
+		Id:        ctx.AllocID,
+		logger:    d.logger,
+		doneCh:    make(chan struct{}),
+		waitCh:    make(chan *cstructs.WaitResult, 1),
+		executor:  executor,
+		Pipeline:  config.Pipeline,
+		RunId:     config.RunId,
+		ServerURL: gypsyServerURL,
 	}
 
 	if err := h.executor.Limit(task.Resources); err != nil {
@@ -89,7 +98,7 @@ func (h *gypsyHandle) performBuild() error {
 	container := h.executor.Container()
 	h.logger.Printf("[INFO] Waiting for ip allocation of container: ", container.Name())
 	container.WaitIPAddresses(30 * time.Second)
-	client := gypsy.NewClient("http://127.0.0.1:5678", h.Pipeline, h.RunId)
+	client := gypsy.NewClient(h.ServerURL, h.Pipeline, h.RunId)
 	pipeline, err := client.FetchPipeline(h.Pipeline)
 	if err != nil {
 		h.logger.Printf("[ERR] Failed to fetch pipeline %s", err)
