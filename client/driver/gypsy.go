@@ -96,7 +96,7 @@ func (d *GypsyDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle,
 
 func (h *gypsyHandle) performBuild() error {
 	container := h.executor.Container()
-	h.logger.Printf("[INFO] Waiting for ip allocation of container: ", container.Name())
+	h.logger.Printf("[INFO] Waiting for ip allocation of container: %s\n", container.Name())
 	container.WaitIPAddresses(30 * time.Second)
 	client := gypsy.NewClient(h.ServerURL, h.Pipeline, h.RunId)
 	pipeline, err := client.FetchPipeline(h.Pipeline)
