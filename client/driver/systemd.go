@@ -43,7 +43,7 @@ func (d *SystemdDriver) Fingerprint(cfg *config.Config, node *structs.Node) (boo
 		return false, err
 	}
 	defer conn.Close()
-	v, err := conn.GetProperty("Version")
+	v, err := conn.GetManagerProperty("Version")
 	if err != nil {
 		return false, err
 	}

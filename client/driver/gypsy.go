@@ -7,7 +7,7 @@ import (
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
-	gypsy "github.com/ranjib/gypsy/client"
+	gypsy "github.com/ranjib/gypsy/build"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 	"log"
 	"time"
@@ -98,7 +98,7 @@ func (h *gypsyHandle) performBuild() error {
 	container := h.executor.Container()
 	h.logger.Printf("[INFO] Waiting for ip allocation of container: %s\n", container.Name())
 	container.WaitIPAddresses(30 * time.Second)
-	client := gypsy.NewClient(h.ServerURL, h.Pipeline, h.RunId)
+	client := gypsy.NewBuilder(h.ServerURL, h.Pipeline, h.RunId)
 	pipeline, err := client.FetchPipeline(h.Pipeline)
 	if err != nil {
 		h.logger.Printf("[ERR] Failed to fetch pipeline %s", err)
