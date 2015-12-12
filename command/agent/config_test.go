@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -114,6 +115,11 @@ func TestConfig_Merge(t *testing.T) {
 			NumSchedulers:     2,
 			EnabledSchedulers: []string{structs.JobTypeBatch},
 			NodeGCThreshold:   "12h",
+			RejoinAfterLeave:  true,
+			StartJoin:         []string{"1.1.1.1"},
+			RetryJoin:         []string{"1.1.1.1"},
+			RetryInterval:     "10s",
+			retryInterval:     time.Second * 10,
 		},
 		Ports: &Ports{
 			HTTP: 20000,
@@ -266,6 +272,12 @@ func TestConfig_LoadConfig(t *testing.T) {
 		t.Fatalf("bad: %#v", config)
 	}
 
+	expectedConfigFiles := []string{fh.Name()}
+	if !reflect.DeepEqual(config.Files, expectedConfigFiles) {
+		t.Errorf("Loaded configs don't match\nExpected\n%+vGot\n%+v\n",
+			expectedConfigFiles, config.Files)
+	}
+
 	dir, err := ioutil.TempDir("", "nomad")
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -286,19 +298,54 @@ func TestConfig_LoadConfig(t *testing.T) {
 	if config.Datacenter != "sfo" {
 		t.Fatalf("bad: %#v", config)
 	}
+
+	expectedConfigFiles = []string{file1}
+	if !reflect.DeepEqual(config.Files, expectedConfigFiles) {
+		t.Errorf("Loaded configs don't match\nExpected\n%+vGot\n%+v\n",
+			expectedConfigFiles, config.Files)
+	}
+}
+
+func TestConfig_LoadConfigsFileOrder(t *testing.T) {
+	config1, err := LoadConfigDir("test-resources/etcnomad")
+	if err != nil {
+		t.Fatalf("Failed to load config: %s", err)
+	}
+
+	config2, err := LoadConfig("test-resources/myconf")
+	if err != nil {
+		t.Fatalf("Failed to load config: %s", err)
+	}
+
+	expected := []string{
+		// filepath.FromSlash changes these to backslash \ on Windows
+		filepath.FromSlash("test-resources/etcnomad/common.hcl"),
+		filepath.FromSlash("test-resources/etcnomad/server.json"),
+		filepath.FromSlash("test-resources/myconf"),
+	}
+
+	config := config1.Merge(config2)
+
+	if !reflect.DeepEqual(config.Files, expected) {
+		t.Errorf("Loaded configs don't match\nExpected\n%+vGot\n%+v\n",
+			expected, config.Files)
+	}
 }
 
 func TestConfig_Listener(t *testing.T) {
 	config := DefaultConfig()
 
 	// Fails on invalid input
-	if _, err := config.Listener("tcp", "nope", 8080); err == nil {
+	if ln, err := config.Listener("tcp", "nope", 8080); err == nil {
+		ln.Close()
 		t.Fatalf("expected addr error")
 	}
-	if _, err := config.Listener("nope", "127.0.0.1", 8080); err == nil {
+	if ln, err := config.Listener("nope", "127.0.0.1", 8080); err == nil {
+		ln.Close()
 		t.Fatalf("expected protocol err")
 	}
-	if _, err := config.Listener("tcp", "127.0.0.1", -1); err == nil {
+	if ln, err := config.Listener("tcp", "127.0.0.1", -1); err == nil {
+		ln.Close()
 		t.Fatalf("expected port error")
 	}
 
@@ -384,6 +431,11 @@ func TestConfig_LoadConfigString(t *testing.T) {
 			NumSchedulers:     2,
 			EnabledSchedulers: []string{"test"},
 			NodeGCThreshold:   "12h",
+			RetryJoin:         []string{"1.1.1.1", "2.2.2.2"},
+			StartJoin:         []string{"1.1.1.1", "2.2.2.2"},
+			RetryInterval:     "15s",
+			RejoinAfterLeave:  true,
+			RetryMaxAttempts:  3,
 		},
 		Telemetry: &Telemetry{
 			StatsiteAddr:    "127.0.0.1:1234",
@@ -457,6 +509,11 @@ server {
 	num_schedulers = 2
 	enabled_schedulers = ["test"]
 	node_gc_threshold = "12h"
+	retry_join = [ "1.1.1.1", "2.2.2.2" ]
+	start_join = [ "1.1.1.1", "2.2.2.2" ]
+	retry_max = 3
+	retry_interval = "15s"
+	rejoin_after_leave = true
 }
 telemetry {
 	statsite_address = "127.0.0.1:1234"

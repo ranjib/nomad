@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/hcl"
 	client "github.com/hashicorp/nomad/client/config"
@@ -96,6 +97,9 @@ type Config struct {
 	Revision          string
 	Version           string
 	VersionPrerelease string
+
+	// List of config files that have been loaded (in order)
+	Files []string
 }
 
 // AtlasConfig is used to enable an parameterize the Atlas integration
@@ -181,6 +185,31 @@ type ServerConfig struct {
 
 	// NodeGCThreshold contros how "old" a node must be to be collected by GC.
 	NodeGCThreshold string `hcl:"node_gc_threshold"`
+
+	// StartJoin is a list of addresses to attempt to join when the
+	// agent starts. If Serf is unable to communicate with any of these
+	// addresses, then the agent will error and exit.
+	StartJoin []string `hcl:"start_join"`
+
+	// RetryJoin is a list of addresses to join with retry enabled.
+	RetryJoin []string `hcl:"retry_join"`
+
+	// RetryMaxAttempts specifies the maximum number of times to retry joining a
+	// host on startup. This is useful for cases where we know the node will be
+	// online eventually.
+	RetryMaxAttempts int `hcl:"retry_max"`
+
+	// RetryInterval specifies the amount of time to wait in between join
+	// attempts on agent start. The minimum allowed value is 1 second and
+	// the default is 30s.
+	RetryInterval string        `hcl:"retry_interval"`
+	retryInterval time.Duration `hcl:"-"`
+
+	// RejoinAfterLeave controls our interaction with the cluster after leave.
+	// When set to false (default), a leave causes Consul to not rejoin
+	// the cluster until an explicit join is received. If this is set to
+	// true, we ignore the leave, and rejoin the cluster on start.
+	RejoinAfterLeave bool `hcl:"rejoin_after_leave"`
 }
 
 // Telemetry is the telemetry configuration for the server
@@ -228,6 +257,9 @@ func DevConfig() *Config {
 	} else if runtime.GOOS == "linux" {
 		conf.Client.NetworkInterface = "lo"
 	}
+	conf.Client.Options = map[string]string{
+		"driver.raw_exec.enable": "true",
+	}
 
 	return conf
 }
@@ -252,23 +284,44 @@ func DefaultConfig() *Config {
 			NetworkSpeed: 100,
 		},
 		Server: &ServerConfig{
-			Enabled: false,
+			Enabled:          false,
+			StartJoin:        []string{},
+			RetryJoin:        []string{},
+			RetryInterval:    "30s",
+			RetryMaxAttempts: 0,
 		},
+		SyslogFacility: "LOCAL0",
 	}
 }
 
-// GetListener can be used to get a new listener using a custom bind address.
+// Listener can be used to get a new listener using a custom bind address.
 // If the bind provided address is empty, the BindAddr is used instead.
 func (c *Config) Listener(proto, addr string, port int) (net.Listener, error) {
 	if addr == "" {
 		addr = c.BindAddr
 	}
+
+	// Do our own range check to avoid bugs in package net.
+	//
+	//   golang.org/issue/11715
+	//   golang.org/issue/13447
+	//
+	// Both of the above bugs were fixed by golang.org/cl/12447 which will be
+	// included in Go 1.6. The error returned below is the same as what Go 1.6
+	// will return.
+	if 0 > port || port > 65535 {
+		return nil, &net.OpError{
+			Op:  "listen",
+			Net: proto,
+			Err: &net.AddrError{Err: "invalid port", Addr: fmt.Sprint(port)},
+		}
+	}
 	return net.Listen(proto, fmt.Sprintf("%s:%d", addr, port))
 }
 
 // Merge merges two configurations.
-func (a *Config) Merge(b *Config) *Config {
-	var result Config = *a
+func (c *Config) Merge(b *Config) *Config {
+	result := *c
 
 	if b.Region != "" {
 		result.Region = b.Region
@@ -366,12 +419,15 @@ func (a *Config) Merge(b *Config) *Config {
 		result.Atlas = result.Atlas.Merge(b.Atlas)
 	}
 
+	// Merge config files lists
+	result.Files = append(result.Files, b.Files...)
+
 	return &result
 }
 
 // Merge is used to merge two server configs together
 func (a *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
-	var result ServerConfig = *a
+	result := *a
 
 	if b.Enabled {
 		result.Enabled = true
@@ -391,16 +447,36 @@ func (a *ServerConfig) Merge(b *ServerConfig) *ServerConfig {
 	if b.NodeGCThreshold != "" {
 		result.NodeGCThreshold = b.NodeGCThreshold
 	}
+	if b.RetryMaxAttempts != 0 {
+		result.RetryMaxAttempts = b.RetryMaxAttempts
+	}
+	if b.RetryInterval != "" {
+		result.RetryInterval = b.RetryInterval
+		result.retryInterval = b.retryInterval
+	}
+	if b.RejoinAfterLeave {
+		result.RejoinAfterLeave = true
+	}
 
 	// Add the schedulers
 	result.EnabledSchedulers = append(result.EnabledSchedulers, b.EnabledSchedulers...)
+
+	// Copy the start join addresses
+	result.StartJoin = make([]string, 0, len(a.StartJoin)+len(b.StartJoin))
+	result.StartJoin = append(result.StartJoin, a.StartJoin...)
+	result.StartJoin = append(result.StartJoin, b.StartJoin...)
+
+	// Copy the retry join addresses
+	result.RetryJoin = make([]string, 0, len(a.RetryJoin)+len(b.RetryJoin))
+	result.RetryJoin = append(result.RetryJoin, a.RetryJoin...)
+	result.RetryJoin = append(result.RetryJoin, b.RetryJoin...)
 
 	return &result
 }
 
 // Merge is used to merge two client configs together
 func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
-	var result ClientConfig = *a
+	result := *a
 
 	if b.Enabled {
 		result.Enabled = true
@@ -448,7 +524,7 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 
 // Merge is used to merge two telemetry configs together
 func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
-	var result Telemetry = *a
+	result := *a
 
 	if b.StatsiteAddr != "" {
 		result.StatsiteAddr = b.StatsiteAddr
@@ -464,7 +540,7 @@ func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
 
 // Merge is used to merge two port configurations.
 func (a *Ports) Merge(b *Ports) *Ports {
-	var result Ports = *a
+	result := *a
 
 	if b.HTTP != 0 {
 		result.HTTP = b.HTTP
@@ -480,7 +556,7 @@ func (a *Ports) Merge(b *Ports) *Ports {
 
 // Merge is used to merge two address configs together.
 func (a *Addresses) Merge(b *Addresses) *Addresses {
-	var result Addresses = *a
+	result := *a
 
 	if b.HTTP != "" {
 		result.HTTP = b.HTTP
@@ -496,7 +572,7 @@ func (a *Addresses) Merge(b *Addresses) *Addresses {
 
 // Merge merges two advertise addrs configs together.
 func (a *AdvertiseAddrs) Merge(b *AdvertiseAddrs) *AdvertiseAddrs {
-	var result AdvertiseAddrs = *a
+	result := *a
 
 	if b.RPC != "" {
 		result.RPC = b.RPC
@@ -509,7 +585,7 @@ func (a *AdvertiseAddrs) Merge(b *AdvertiseAddrs) *AdvertiseAddrs {
 
 // Merge merges two Atlas configurations together.
 func (a *AtlasConfig) Merge(b *AtlasConfig) *AtlasConfig {
-	var result AtlasConfig = *a
+	result := *a
 
 	if b.Infrastructure != "" {
 		result.Infrastructure = b.Infrastructure
@@ -536,9 +612,8 @@ func LoadConfig(path string) (*Config, error) {
 
 	if fi.IsDir() {
 		return LoadConfigDir(path)
-	} else {
-		return LoadConfigFile(path)
 	}
+	return LoadConfigFile(path)
 }
 
 // LoadConfigString is used to parse a config string
@@ -565,7 +640,13 @@ func LoadConfigFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return LoadConfigString(string(d))
+
+	config, err := LoadConfigString(string(d))
+	if err == nil {
+		config.Files = append(config.Files, path)
+	}
+
+	return config, err
 }
 
 // LoadConfigDir loads all the configurations in the given directory

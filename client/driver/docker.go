@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	docker "github.com/fsouza/go-dockerclient"
 
@@ -19,6 +20,10 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
 )
+
+// We store the client globally to cache the connection to the docker daemon.
+var createClient sync.Once
+var client *docker.Client
 
 type DockerDriver struct {
 	DriverContext
@@ -83,28 +88,37 @@ func NewDockerDriver(ctx *DriverContext) Driver {
 // to connect to the docker daemon. In production mode we will read
 // docker.endpoint from the config file.
 func (d *DockerDriver) dockerClient() (*docker.Client, error) {
-	// Default to using whatever is configured in docker.endpoint. If this is
-	// not specified we'll fall back on NewClientFromEnv which reads config from
-	// the DOCKER_* environment variables DOCKER_HOST, DOCKER_TLS_VERIFY, and
-	// DOCKER_CERT_PATH. This allows us to lock down the config in production
-	// but also accept the standard ENV configs for dev and test.
-	dockerEndpoint := d.config.Read("docker.endpoint")
-	if dockerEndpoint != "" {
-		cert := d.config.Read("docker.tls.cert")
-		key := d.config.Read("docker.tls.key")
-		ca := d.config.Read("docker.tls.ca")
-
-		if cert+key+ca != "" {
-			d.logger.Printf("[DEBUG] driver.docker: using TLS client connection to %s", dockerEndpoint)
-			return docker.NewTLSClient(dockerEndpoint, cert, key, ca)
-		} else {
-			d.logger.Printf("[DEBUG] driver.docker: using standard client connection to %s", dockerEndpoint)
-			return docker.NewClient(dockerEndpoint)
-		}
+	if client != nil {
+		return client, nil
 	}
 
-	d.logger.Println("[DEBUG] driver.docker: using client connection initialized from environment")
-	return docker.NewClientFromEnv()
+	var err error
+	createClient.Do(func() {
+		// Default to using whatever is configured in docker.endpoint. If this is
+		// not specified we'll fall back on NewClientFromEnv which reads config from
+		// the DOCKER_* environment variables DOCKER_HOST, DOCKER_TLS_VERIFY, and
+		// DOCKER_CERT_PATH. This allows us to lock down the config in production
+		// but also accept the standard ENV configs for dev and test.
+		dockerEndpoint := d.config.Read("docker.endpoint")
+		if dockerEndpoint != "" {
+			cert := d.config.Read("docker.tls.cert")
+			key := d.config.Read("docker.tls.key")
+			ca := d.config.Read("docker.tls.ca")
+
+			if cert+key+ca != "" {
+				d.logger.Printf("[DEBUG] driver.docker: using TLS client connection to %s", dockerEndpoint)
+				client, err = docker.NewTLSClient(dockerEndpoint, cert, key, ca)
+			} else {
+				d.logger.Printf("[DEBUG] driver.docker: using standard client connection to %s", dockerEndpoint)
+				client, err = docker.NewClient(dockerEndpoint)
+			}
+			return
+		}
+
+		d.logger.Println("[DEBUG] driver.docker: using client connection initialized from environment")
+		client, err = docker.NewClientFromEnv()
+	})
+	return client, err
 }
 
 func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
@@ -441,27 +455,27 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 				},
 			})
 			if err != nil {
-				log.Printf("[ERR] driver.docker: failed to query list of containers matching name:%s", config.Name)
+				d.logger.Printf("[ERR] driver.docker: failed to query list of containers matching name:%s", config.Name)
 				return nil, fmt.Errorf("Failed to query list of containers: %s", err)
 			}
 
 			if len(containers) != 1 {
-				log.Printf("[ERR] driver.docker: failed to get id for container %s", config.Name)
+				d.logger.Printf("[ERR] driver.docker: failed to get id for container %s", config.Name)
 				return nil, fmt.Errorf("Failed to get id for container %s", config.Name)
 			}
 
-			log.Printf("[INFO] driver.docker: a container with the name %s already exists; will attempt to purge and re-create", config.Name)
+			d.logger.Printf("[INFO] driver.docker: a container with the name %s already exists; will attempt to purge and re-create", config.Name)
 			err = client.RemoveContainer(docker.RemoveContainerOptions{
 				ID: containers[0].ID,
 			})
 			if err != nil {
-				log.Printf("[ERR] driver.docker: failed to purge container %s", config.Name)
+				d.logger.Printf("[ERR] driver.docker: failed to purge container %s", config.Name)
 				return nil, fmt.Errorf("Failed to purge container %s: %s", config.Name, err)
 			}
-			log.Printf("[INFO] driver.docker: purged container %s", config.Name)
+			d.logger.Printf("[INFO] driver.docker: purged container %s", config.Name)
 			container, err = client.CreateContainer(config)
 			if err != nil {
-				log.Printf("[ERR] driver.docker: failed to re-create container %s; aborting", config.Name)
+				d.logger.Printf("[ERR] driver.docker: failed to re-create container %s; aborting", config.Name)
 				return nil, fmt.Errorf("Failed to re-create container %s; aborting", config.Name)
 			}
 		} else {
@@ -579,10 +593,10 @@ func (h *DockerHandle) Kill() error {
 	// Stop the container
 	err := h.client.StopContainer(h.containerID, 5)
 	if err != nil {
-		log.Printf("[ERR] driver.docker: failed to stop container %s", h.containerID)
+		h.logger.Printf("[ERR] driver.docker: failed to stop container %s", h.containerID)
 		return fmt.Errorf("Failed to stop container %s: %s", h.containerID, err)
 	}
-	log.Printf("[INFO] driver.docker: stopped container %s", h.containerID)
+	h.logger.Printf("[INFO] driver.docker: stopped container %s", h.containerID)
 
 	// Cleanup container
 	if h.cleanupContainer {
@@ -591,10 +605,10 @@ func (h *DockerHandle) Kill() error {
 			RemoveVolumes: true,
 		})
 		if err != nil {
-			log.Printf("[ERR] driver.docker: failed to remove container %s", h.containerID)
+			h.logger.Printf("[ERR] driver.docker: failed to remove container %s", h.containerID)
 			return fmt.Errorf("Failed to remove container %s: %s", h.containerID, err)
 		}
-		log.Printf("[INFO] driver.docker: removed container %s", h.containerID)
+		h.logger.Printf("[INFO] driver.docker: removed container %s", h.containerID)
 	}
 
 	// Cleanup image. This operation may fail if the image is in use by another
@@ -610,17 +624,17 @@ func (h *DockerHandle) Kill() error {
 				},
 			})
 			if err != nil {
-				log.Printf("[ERR] driver.docker: failed to query list of containers matching image:%s", h.imageID)
+				h.logger.Printf("[ERR] driver.docker: failed to query list of containers matching image:%s", h.imageID)
 				return fmt.Errorf("Failed to query list of containers: %s", err)
 			}
 			inUse := len(containers)
 			if inUse > 0 {
-				log.Printf("[INFO] driver.docker: image %s is still in use by %d container(s)", h.imageID, inUse)
+				h.logger.Printf("[INFO] driver.docker: image %s is still in use by %d container(s)", h.imageID, inUse)
 			} else {
 				return fmt.Errorf("Failed to remove image %s", h.imageID)
 			}
 		} else {
-			log.Printf("[INFO] driver.docker: removed image %s", h.imageID)
+			h.logger.Printf("[INFO] driver.docker: removed image %s", h.imageID)
 		}
 	}
 	return nil
