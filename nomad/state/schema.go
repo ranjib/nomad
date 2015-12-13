@@ -18,6 +18,7 @@ func stateStoreSchema() *memdb.DBSchema {
 		indexTableSchema,
 		nodeTableSchema,
 		jobTableSchema,
+		periodicLaunchTableSchema,
 		evalTableSchema,
 		allocTableSchema,
 	}
@@ -98,6 +99,45 @@ func jobTableSchema() *memdb.TableSchema {
 				Indexer: &memdb.StringFieldIndex{
 					Field:     "Type",
 					Lowercase: false,
+				},
+			},
+			"parent": &memdb.IndexSchema{
+				Name:         "parent",
+				AllowMissing: true,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field:     "ParentID",
+					Lowercase: true,
+				},
+			},
+			"periodic": &memdb.IndexSchema{
+				Name:         "periodic",
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.FieldSetIndex{
+					Field: "Periodic",
+				},
+			},
+		},
+	}
+}
+
+// periodicLaunchTableSchema returns the MemDB schema tracking the most recent
+// launch time for a perioidic job.
+func periodicLaunchTableSchema() *memdb.TableSchema {
+	return &memdb.TableSchema{
+		Name: "periodic_launch",
+		Indexes: map[string]*memdb.IndexSchema{
+			// Primary index is used for job management
+			// and simple direct lookup. ID is required to be
+			// unique.
+			"id": &memdb.IndexSchema{
+				Name:         "id",
+				AllowMissing: false,
+				Unique:       true,
+				Indexer: &memdb.StringFieldIndex{
+					Field:     "ID",
+					Lowercase: true,
 				},
 			},
 		},
