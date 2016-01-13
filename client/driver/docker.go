@@ -17,7 +17,6 @@ import (
 	"github.com/hashicorp/nomad/client/config"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
-	"github.com/hashicorp/nomad/helper/args"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
 )
@@ -42,7 +41,10 @@ type DockerDriverConfig struct {
 	ImageName        string              `mapstructure:"image"`              // Container's Image Name
 	Command          string              `mapstructure:"command"`            // The Command/Entrypoint to run when the container starts up
 	Args             []string            `mapstructure:"args"`               // The arguments to the Command/Entrypoint
+	IpcMode          string              `mapstructure:"ipc_mode"`           // The IPC mode of the container - host and none
 	NetworkMode      string              `mapstructure:"network_mode"`       // The network mode of the container - host, net and none
+	PidMode          string              `mapstructure:"pid_mode"`           // The PID mode of the container - host and none
+	UTSMode          string              `mapstructure:"uts_mode"`           // The UTS mode of the container - host and none
 	PortMapRaw       []map[string]int    `mapstructure:"port_map"`           //
 	PortMap          map[string]int      `mapstructure:"-"`                  // A map of host port labels and the ports exposed on the container
 	Privileged       bool                `mapstructure:"privileged"`         // Flag to run the container in priviledged mode
@@ -185,9 +187,12 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task, dri
 	}
 
 	// Create environment variables.
-	env := TaskEnvironmentVariables(ctx, task)
-	env.SetAllocDir(filepath.Join("/", allocdir.SharedAllocName))
-	env.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
+	taskEnv, err := GetTaskEnv(ctx.AllocDir, d.node, task)
+	if err != nil {
+		return c, err
+	}
+	taskEnv.SetAllocDir(filepath.Join("/", allocdir.SharedAllocName))
+	taskEnv.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
 
 	config := &docker.Config{
 		Image:    driverConfig.ImageName,
@@ -255,6 +260,30 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task, dri
 		hostConfig.DNSSearch = append(hostConfig.DNSSearch, domain)
 	}
 
+	if driverConfig.IpcMode != "" {
+		if !hostPrivileged {
+			return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent, setting ipc mode not allowed`)
+		}
+		d.logger.Printf("[DEBUG] driver.docker: setting ipc mode to %s", driverConfig.IpcMode)
+	}
+	hostConfig.IpcMode = driverConfig.IpcMode
+
+	if driverConfig.PidMode != "" {
+		if !hostPrivileged {
+			return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent, setting pid mode not allowed`)
+		}
+		d.logger.Printf("[DEBUG] driver.docker: setting pid mode to %s", driverConfig.PidMode)
+	}
+	hostConfig.PidMode = driverConfig.PidMode
+
+	if driverConfig.UTSMode != "" {
+		if !hostPrivileged {
+			return c, fmt.Errorf(`Docker privileged mode is disabled on this Nomad agent, setting UTS mode not allowed`)
+		}
+		d.logger.Printf("[DEBUG] driver.docker: setting UTS mode to %s", driverConfig.UTSMode)
+	}
+	hostConfig.UTSMode = driverConfig.UTSMode
+
 	hostConfig.NetworkMode = driverConfig.NetworkMode
 	if hostConfig.NetworkMode == "" {
 		// docker default
@@ -316,20 +345,20 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task, dri
 			d.logger.Printf("[DEBUG] driver.docker: exposed port %s", containerPort)
 		}
 
-		// This was set above in a call to TaskEnvironmentVariables but if we
+		// This was set above in a call to GetTaskEnv but if we
 		// have mapped any ports we will need to override them.
 		//
-		// TODO refactor the implementation in TaskEnvironmentVariables to match
+		// TODO refactor the implementation in GetTaskEnv to match
 		// the 0.2 ports world view. Docker seems to be the only place where
 		// this is actually needed, but this is kinda hacky.
 		if len(driverConfig.PortMap) > 0 {
-			env.SetPorts(network.MapLabelToValues(driverConfig.PortMap))
+			taskEnv.SetPorts(network.MapLabelToValues(driverConfig.PortMap))
 		}
 		hostConfig.PortBindings = publishedPorts
 		config.ExposedPorts = exposedPorts
 	}
 
-	parsedArgs := args.ParseAndReplace(driverConfig.Args, env.Map())
+	parsedArgs := taskEnv.ParseAndReplace(driverConfig.Args)
 
 	// If the user specified a custom command to run as their entrypoint, we'll
 	// inject it here.
@@ -349,7 +378,7 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task, dri
 		d.logger.Printf("[DEBUG] driver.docker: applied labels on the container: %+v", config.Labels)
 	}
 
-	config.Env = env.List()
+	config.Env = taskEnv.EnvList()
 
 	containerName := fmt.Sprintf("%s-%s", task.Name, ctx.AllocID)
 	d.logger.Printf("[DEBUG] driver.docker: setting container name to: %s", containerName)
