@@ -26,10 +26,12 @@ General Options:
 
   ` + generalOptionsUsage() + `
 
-Alloc Status Options:
 
   -short
     Display short output. Shows only the most recent task event.
+
+  -verbose
+    Show full information.
 `
 
 	return strings.TrimSpace(helpText)
@@ -40,11 +42,12 @@ func (c *AllocStatusCommand) Synopsis() string {
 }
 
 func (c *AllocStatusCommand) Run(args []string) int {
-	var short bool
+	var short, verbose bool
 
 	flags := c.Meta.FlagSet("alloc-status", FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&short, "short", false, "")
+	flags.BoolVar(&verbose, "verbose", false, "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -65,9 +68,25 @@ func (c *AllocStatusCommand) Run(args []string) int {
 		return 1
 	}
 
+	// Truncate the id unless full length is requested
+	length := shortId
+	if verbose {
+		length = fullId
+	}
+
 	// Query the allocation info
 	alloc, _, err := client.Allocations().Info(allocID, nil)
 	if err != nil {
+		if len(allocID) == 1 {
+			c.Ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
+			return 1
+		}
+		if len(allocID)%2 == 1 {
+			// Identifiers must be of even length, so we strip off the last byte
+			// to provide a consistent user experience.
+			allocID = allocID[:len(allocID)-1]
+		}
+
 		allocs, _, err := client.Allocations().PrefixList(allocID)
 		if err != nil {
 			c.Ui.Error(fmt.Sprintf("Error querying allocation: %v", err))
@@ -80,15 +99,16 @@ func (c *AllocStatusCommand) Run(args []string) int {
 		if len(allocs) > 1 {
 			// Format the allocs
 			out := make([]string, len(allocs)+1)
-			out[0] = "ID|EvalID|JobID|TaskGroup|DesiredStatus|ClientStatus"
+			out[0] = "ID|Eval ID|Job ID|Task Group|Desired Status|Client Status"
 			for i, alloc := range allocs {
 				out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-					alloc.ID,
-					alloc.EvalID,
+					alloc.ID[:length],
+					alloc.EvalID[:length],
 					alloc.JobID,
 					alloc.TaskGroup,
 					alloc.DesiredStatus,
-					alloc.ClientStatus)
+					alloc.ClientStatus,
+				)
 			}
 			c.Ui.Output(fmt.Sprintf("Prefix matched multiple allocations\n\n%s", formatList(out)))
 			return 0
@@ -103,17 +123,17 @@ func (c *AllocStatusCommand) Run(args []string) int {
 
 	// Format the allocation data
 	basic := []string{
-		fmt.Sprintf("ID|%s", alloc.ID),
-		fmt.Sprintf("EvalID|%s", alloc.EvalID),
+		fmt.Sprintf("ID|%s", alloc.ID[:length]),
+		fmt.Sprintf("Eval ID|%s", alloc.EvalID[:length]),
 		fmt.Sprintf("Name|%s", alloc.Name),
-		fmt.Sprintf("NodeID|%s", alloc.NodeID),
-		fmt.Sprintf("JobID|%s", alloc.JobID),
-		fmt.Sprintf("ClientStatus|%s", alloc.ClientStatus),
-		fmt.Sprintf("NodesEvaluated|%d", alloc.Metrics.NodesEvaluated),
-		fmt.Sprintf("NodesFiltered|%d", alloc.Metrics.NodesFiltered),
-		fmt.Sprintf("NodesExhausted|%d", alloc.Metrics.NodesExhausted),
-		fmt.Sprintf("AllocationTime|%s", alloc.Metrics.AllocationTime),
-		fmt.Sprintf("CoalescedFailures|%d", alloc.Metrics.CoalescedFailures),
+		fmt.Sprintf("Node ID|%s", alloc.NodeID[:length]),
+		fmt.Sprintf("Job ID|%s", alloc.JobID),
+		fmt.Sprintf("Client Status|%s", alloc.ClientStatus),
+		fmt.Sprintf("Evaluated Nodes|%d", alloc.Metrics.NodesEvaluated),
+		fmt.Sprintf("Filtered Nodes|%d", alloc.Metrics.NodesFiltered),
+		fmt.Sprintf("Exhausted Nodes|%d", alloc.Metrics.NodesExhausted),
+		fmt.Sprintf("Allocation Time|%s", alloc.Metrics.AllocationTime),
+		fmt.Sprintf("Failures|%d", alloc.Metrics.CoalescedFailures),
 	}
 	c.Ui.Output(formatKV(basic))
 
@@ -126,7 +146,7 @@ func (c *AllocStatusCommand) Run(args []string) int {
 
 	// Format the detailed status
 	c.Ui.Output("\n==> Status")
-	dumpAllocStatus(c.Ui, alloc)
+	dumpAllocStatus(c.Ui, alloc, length)
 
 	return 0
 }
@@ -134,7 +154,7 @@ func (c *AllocStatusCommand) Run(args []string) int {
 // shortTaskStatus prints out the current state of each task.
 func (c *AllocStatusCommand) shortTaskStatus(alloc *api.Allocation) {
 	tasks := make([]string, 0, len(alloc.TaskStates)+1)
-	tasks = append(tasks, "Name|State|LastEvent|Time")
+	tasks = append(tasks, "Name|State|Last Event|Time")
 	for task := range c.sortedTaskStateIterator(alloc.TaskStates) {
 		fmt.Println(task)
 		state := alloc.TaskStates[task]

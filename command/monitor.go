@@ -61,12 +61,16 @@ type monitor struct {
 	client *api.Client
 	state  *evalState
 
+	// length determines the number of characters for identifiers in the ui.
+	length int
+
 	sync.Mutex
 }
 
 // newMonitor returns a new monitor. The returned monitor will
-// write output information to the provided ui.
-func newMonitor(ui cli.Ui, client *api.Client) *monitor {
+// write output information to the provided ui. The length parameter determines
+// the number of characters for identifiers in the ui.
+func newMonitor(ui cli.Ui, client *api.Client, length int) *monitor {
 	mon := &monitor{
 		ui: &cli.PrefixedUi{
 			InfoPrefix:   "==> ",
@@ -76,6 +80,7 @@ func newMonitor(ui cli.Ui, client *api.Client) *monitor {
 		},
 		client: client,
 		state:  newEvalState(),
+		length: length,
 	}
 	return mon
 }
@@ -97,7 +102,7 @@ func (m *monitor) update(update *evalState) {
 	// Check if the evaluation was triggered by a node
 	if existing.node == "" && update.node != "" {
 		m.ui.Output(fmt.Sprintf("Evaluation triggered by node %q",
-			update.node))
+			update.node[:m.length]))
 	}
 
 	// Check if the evaluation was triggered by a job
@@ -123,7 +128,7 @@ func (m *monitor) update(update *evalState) {
 				// Generate a more descriptive error for why the allocation
 				// failed and dump it to the screen
 				if alloc.full != nil {
-					dumpAllocStatus(m.ui, alloc.full)
+					dumpAllocStatus(m.ui, alloc.full, m.length)
 				}
 
 			case alloc.index < update.index:
@@ -131,13 +136,13 @@ func (m *monitor) update(update *evalState) {
 				// create index indicates modification
 				m.ui.Output(fmt.Sprintf(
 					"Allocation %q modified: node %q, group %q",
-					alloc.id, alloc.node, alloc.group))
+					alloc.id[:m.length], alloc.node[:m.length], alloc.group))
 
 			case alloc.desired == structs.AllocDesiredStatusRun:
 				// New allocation with desired status running
 				m.ui.Output(fmt.Sprintf(
 					"Allocation %q created: node %q, group %q",
-					alloc.id, alloc.node, alloc.group))
+					alloc.id[:m.length], alloc.node[:m.length], alloc.group))
 			}
 		} else {
 			switch {
@@ -145,7 +150,7 @@ func (m *monitor) update(update *evalState) {
 				// Allocation status has changed
 				m.ui.Output(fmt.Sprintf(
 					"Allocation %q status changed: %q -> %q (%s)",
-					alloc.id, existing.client, alloc.client, alloc.clientDesc))
+					alloc.id[:m.length], existing.client, alloc.client, alloc.clientDesc))
 			}
 		}
 	}
@@ -175,10 +180,14 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 	// carry that status into the return code.
 	var schedFailure bool
 
+	// The user may have specified a prefix as eval id. We need to lookup the
+	// full id from the database first. Since we do this in a loop we need a
+	// variable to keep track if we've already written the header message.
+	var headerWritten bool
+
 	// Add the initial pending state
 	m.update(newEvalState())
 
-	m.ui.Info(fmt.Sprintf("Monitoring evaluation %q", evalID))
 	for {
 		// Query the evaluation
 		eval, _, err := m.client.Evaluations().Info(evalID, nil)
@@ -186,6 +195,15 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 			if !allowPrefix {
 				m.ui.Error(fmt.Sprintf("No evaluation with id %q found", evalID))
 				return 1
+			}
+			if len(evalID) == 1 {
+				m.ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
+				return 1
+			}
+			if len(evalID)%2 == 1 {
+				// Identifiers must be of even length, so we strip off the last byte
+				// to provide a consistent user experience.
+				evalID = evalID[:len(evalID)-1]
 			}
 
 			evals, _, err := m.client.Evaluations().PrefixList(evalID)
@@ -200,10 +218,10 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 			if len(evals) > 1 {
 				// Format the evaluations
 				out := make([]string, len(evals)+1)
-				out[0] = "ID|Priority|Type|TriggeredBy|Status"
+				out[0] = "ID|Priority|Type|Triggered By|Status"
 				for i, eval := range evals {
 					out[i+1] = fmt.Sprintf("%s|%d|%s|%s|%s",
-						eval.ID,
+						eval.ID[:m.length],
 						eval.Priority,
 						eval.Type,
 						eval.TriggeredBy,
@@ -217,6 +235,11 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 			if err != nil {
 				m.ui.Error(fmt.Sprintf("Error reading evaluation: %s", err))
 			}
+		}
+
+		if !headerWritten {
+			m.ui.Info(fmt.Sprintf("Monitoring evaluation %q", eval.ID[:m.length]))
+			headerWritten = true
 		}
 
 		// Create the new eval state.
@@ -267,7 +290,7 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 		switch eval.Status {
 		case structs.EvalStatusComplete, structs.EvalStatusFailed:
 			m.ui.Info(fmt.Sprintf("Evaluation %q finished with status %q",
-				eval.ID, eval.Status))
+				eval.ID[:m.length], eval.Status))
 		default:
 			// Wait for the next update
 			time.Sleep(updateWait)
@@ -302,10 +325,10 @@ func (m *monitor) monitor(evalID string, allowPrefix bool) int {
 // dumpAllocStatus is a helper to generate a more user-friendly error message
 // for scheduling failures, displaying a high level status of why the job
 // could not be scheduled out.
-func dumpAllocStatus(ui cli.Ui, alloc *api.Allocation) {
+func dumpAllocStatus(ui cli.Ui, alloc *api.Allocation, length int) {
 	// Print filter stats
 	ui.Output(fmt.Sprintf("Allocation %q status %q (%d/%d nodes filtered)",
-		alloc.ID, alloc.ClientStatus,
+		alloc.ID[:length], alloc.ClientStatus,
 		alloc.Metrics.NodesFiltered, alloc.Metrics.NodesEvaluated))
 
 	// Print a helpful message if we have an eligibility problem

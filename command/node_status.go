@@ -31,6 +31,9 @@ Node Status Options:
   -short
     Display short output. Used only when a single node is being
     queried, and drops verbose output about node allocations.
+
+  -verbose
+    Display full information.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -40,11 +43,12 @@ func (c *NodeStatusCommand) Synopsis() string {
 }
 
 func (c *NodeStatusCommand) Run(args []string) int {
-	var short bool
+	var short, verbose bool
 
 	flags := c.Meta.FlagSet("node-status", FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&short, "short", false, "")
+	flags.BoolVar(&verbose, "verbose", false, "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -55,6 +59,12 @@ func (c *NodeStatusCommand) Run(args []string) int {
 	if len(args) > 1 {
 		c.Ui.Error(c.Help())
 		return 1
+	}
+
+	// Truncate the id unless full length is requested
+	length := shortId
+	if verbose {
+		length = fullId
 	}
 
 	// Get the HTTP client
@@ -80,10 +90,10 @@ func (c *NodeStatusCommand) Run(args []string) int {
 
 		// Format the nodes list
 		out := make([]string, len(nodes)+1)
-		out[0] = "ID|DC|Name|Class|Drain|Status"
+		out[0] = "ID|Datacenter|Name|Class|Drain|Status"
 		for i, node := range nodes {
 			out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%v|%s",
-				node.ID,
+				node.ID[:length],
 				node.Datacenter,
 				node.Name,
 				node.NodeClass,
@@ -100,6 +110,16 @@ func (c *NodeStatusCommand) Run(args []string) int {
 	nodeID := args[0]
 	node, _, err := client.Nodes().Info(nodeID, nil)
 	if err != nil {
+		if len(nodeID) == 1 {
+			c.Ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
+			return 1
+		}
+		if len(nodeID)%2 == 1 {
+			// Identifiers must be of even length, so we strip off the last byte
+			// to provide a consistent user experience.
+			nodeID = nodeID[:len(nodeID)-1]
+		}
+
 		// Exact lookup failed, try with prefix based search
 		nodes, _, err := client.Nodes().PrefixList(nodeID)
 		if err != nil {
@@ -115,10 +135,10 @@ func (c *NodeStatusCommand) Run(args []string) int {
 			// Format the nodes list that matches the prefix so that the user
 			// can create a more specific request
 			out := make([]string, len(nodes)+1)
-			out[0] = "ID|DC|Name|Class|Drain|Status"
+			out[0] = "ID|Datacenter|Name|Class|Drain|Status"
 			for i, node := range nodes {
 				out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%v|%s",
-					node.ID,
+					node.ID[:length],
 					node.Datacenter,
 					node.Name,
 					node.NodeClass,
@@ -153,7 +173,7 @@ func (c *NodeStatusCommand) Run(args []string) int {
 
 	// Format the output
 	basic := []string{
-		fmt.Sprintf("ID|%s", node.ID),
+		fmt.Sprintf("ID|%s", node.ID[:length]),
 		fmt.Sprintf("Name|%s", node.Name),
 		fmt.Sprintf("Class|%s", node.NodeClass),
 		fmt.Sprintf("Datacenter|%s", node.Datacenter),
@@ -173,11 +193,11 @@ func (c *NodeStatusCommand) Run(args []string) int {
 
 		// Format the allocations
 		allocs = make([]string, len(nodeAllocs)+1)
-		allocs[0] = "ID|EvalID|JobID|TaskGroup|DesiredStatus|ClientStatus"
+		allocs[0] = "ID|Eval ID|Job ID|Task Group|Desired Status|Client Status"
 		for i, alloc := range nodeAllocs {
 			allocs[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-				alloc.ID,
-				alloc.EvalID,
+				alloc.ID[:length],
+				alloc.EvalID[:length],
 				alloc.JobID,
 				alloc.TaskGroup,
 				alloc.DesiredStatus,
@@ -188,7 +208,7 @@ func (c *NodeStatusCommand) Run(args []string) int {
 	// Dump the output
 	c.Ui.Output(formatKV(basic))
 	if !short {
-		c.Ui.Output("\n### Allocations")
+		c.Ui.Output("\n==> Allocations")
 		c.Ui.Output(formatList(allocs))
 	}
 	return 0
