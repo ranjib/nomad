@@ -11,13 +11,15 @@ import (
 )
 
 type LXCExecutorConfig struct {
-	LXCPath   string `mapstructure:"lxc_path"`
-	Name      string `mapstructure:"name"`
-	CloneFrom string `mapstructure:"clone_from"`
-	Template  string `mapstructure:"template"`
-	Distro    string `mapstructure:"distro"`
-	Release   string `mapstructure:"release"`
-	Arch      string `mapstructure:"arch"`
+	LXCPath     string            `mapstructure:"lxc_path"`
+	Name        string            `mapstructure:"name"`
+	CloneFrom   string            `mapstructure:"clone_from"`
+	Template    string            `mapstructure:"template"`
+	Distro      string            `mapstructure:"distro"`
+	Release     string            `mapstructure:"release"`
+	Arch        string            `mapstructure:"arch"`
+	CgroupItems map[string]string `mapstructure:"cgroup_items"`
+	ConfigItems map[string]string `mapstructure:"config_items"`
 }
 
 type LXCExecutor struct {
@@ -110,6 +112,16 @@ func CreateLXCContainer(config *LXCExecutorConfig) (*lxc.Container, error) {
 			return nil, err
 		}
 		container = c
+	}
+	for k, v := range config.CgroupItems {
+		if err := container.SetCgroupItem(k, v); err != nil {
+			return nil, err
+		}
+	}
+	for k, v := range config.ConfigItems {
+		if err := container.SetConfigItem(k, v); err != nil {
+			return nil, err
+		}
 	}
 	return container, nil
 }
