@@ -102,8 +102,8 @@ func (c *AllocStatusCommand) Run(args []string) int {
 			out[0] = "ID|Eval ID|Job ID|Task Group|Desired Status|Client Status"
 			for i, alloc := range allocs {
 				out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-					alloc.ID[:length],
-					alloc.EvalID[:length],
+					limit(alloc.ID, length),
+					limit(alloc.EvalID, length),
 					alloc.JobID,
 					alloc.TaskGroup,
 					alloc.DesiredStatus,
@@ -123,10 +123,10 @@ func (c *AllocStatusCommand) Run(args []string) int {
 
 	// Format the allocation data
 	basic := []string{
-		fmt.Sprintf("ID|%s", alloc.ID[:length]),
-		fmt.Sprintf("Eval ID|%s", alloc.EvalID[:length]),
+		fmt.Sprintf("ID|%s", limit(alloc.ID, length)),
+		fmt.Sprintf("Eval ID|%s", limit(alloc.EvalID, length)),
 		fmt.Sprintf("Name|%s", alloc.Name),
-		fmt.Sprintf("Node ID|%s", alloc.NodeID[:length]),
+		fmt.Sprintf("Node ID|%s", limit(alloc.NodeID, length)),
 		fmt.Sprintf("Job ID|%s", alloc.JobID),
 		fmt.Sprintf("Client Status|%s", alloc.ClientStatus),
 		fmt.Sprintf("Evaluated Nodes|%d", alloc.Metrics.NodesEvaluated),
@@ -220,7 +220,7 @@ func (c *AllocStatusCommand) taskStatus(alloc *api.Allocation) {
 // formatUnixNanoTime is a helper for formating time for output.
 func (c *AllocStatusCommand) formatUnixNanoTime(nano int64) string {
 	t := time.Unix(0, nano)
-	return t.Format("15:04:05 01/02/06")
+	return formatTime(t)
 }
 
 // sortedTaskStateIterator is a helper that takes the task state map and returns a

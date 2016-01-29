@@ -1,6 +1,8 @@
 package command
 
 import (
+	"time"
+
 	"github.com/ryanuber/columnize"
 )
 
@@ -20,4 +22,18 @@ func formatList(in []string) string {
 	columnConf := columnize.DefaultConfig()
 	columnConf.Empty = "<none>"
 	return columnize.Format(in, columnConf)
+}
+
+// Limits the length of the string.
+func limit(s string, length int) string {
+	if len(s) < length {
+		return s[:len(s)]
+	}
+
+	return s[:length]
+}
+
+// formatTime formats the time to string based on RFC822
+func formatTime(t time.Time) string {
+	return t.Format(time.RFC822)
 }

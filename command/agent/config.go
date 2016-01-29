@@ -101,6 +101,10 @@ type Config struct {
 
 	// List of config files that have been loaded (in order)
 	Files []string
+
+	// HTTPAPIResponseHeaders allows users to configure the Nomad http agent to
+	// set arbritrary headers on API responses
+	HTTPAPIResponseHeaders map[string]string `hcl:"http_api_response_headers"`
 }
 
 // AtlasConfig is used to enable an parameterize the Atlas integration
@@ -239,6 +243,7 @@ type Addresses struct {
 // different network services. Not all network services support an
 // advertise address. All are optional and default to BindAddr.
 type AdvertiseAddrs struct {
+	HTTP string `hcl:"http"`
 	RPC  string `hcl:"rpc"`
 	Serf string `hcl:"serf"`
 }

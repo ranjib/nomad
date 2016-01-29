@@ -470,6 +470,10 @@ type Node struct {
 	// Node name
 	Name string
 
+	// HTTPAddr is the address on which the Nomad client is listening for http
+	// requests
+	HTTPAddr string
+
 	// Attributes is an arbitrary set of key/value
 	// data that can be used for constraints. Examples
 	// include "kernel.name=linux", "arch=386", "driver.docker=1",
@@ -499,6 +503,10 @@ type Node struct {
 	// NodeClass is an opaque identifier used to group nodes
 	// together for the purpose of determining scheduling pressure.
 	NodeClass string
+
+	// ComputedClass is a unique id that identifies nodes with a common set of
+	// attributes and capabilities.
+	ComputedClass uint64
 
 	// Drain is controlled by the servers, and not the client.
 	// If true, no jobs will be scheduled to this node, and existing
@@ -1535,10 +1543,15 @@ type Constraint struct {
 	LTarget string // Left-hand target
 	RTarget string // Right-hand target
 	Operand string // Constraint operand (<=, <, =, !=, >, >=), contains, near
+	str     string // Memoized string
 }
 
 func (c *Constraint) String() string {
-	return fmt.Sprintf("%s %s %s", c.LTarget, c.Operand, c.RTarget)
+	if c.str != "" {
+		return c.str
+	}
+	c.str = fmt.Sprintf("%s %s %s", c.LTarget, c.Operand, c.RTarget)
+	return c.str
 }
 
 func (c *Constraint) Validate() error {
