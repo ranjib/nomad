@@ -33,97 +33,93 @@ func (e *LXCExecutor) Container() *lxc.Container {
 }
 
 func NewLXCExecutor(config *LXCExecutorConfig, logger *log.Logger) (*LXCExecutor, error) {
-	container, err := CreateLXCContainer(config)
-	if err != nil {
+	executor := LXCExecutor{
+		config: config,
+		logger: logger,
+	}
+	if err := executor.Create(); err != nil {
 		logger.Printf("[ERROR] failed to create container: %s", err)
 		return nil, err
-	}
-	executor := LXCExecutor{
-		config:    config,
-		container: container,
-		logger:    logger,
 	}
 	return &executor, nil
 }
 
-func createFromTemplate(config *LXCExecutorConfig) (*lxc.Container, error) {
-	if config.Template == "" {
-		return nil, fmt.Errorf("Missing template name for lxc driver")
+func (executor *LXCExecutor) createFromTemplate() error {
+	if executor.config.Template == "" {
+		return fmt.Errorf("Missing template name for lxc driver")
 	}
-	if config.Distro == "" {
-		return nil, fmt.Errorf("Missing distro name for lxc driver")
+	if executor.config.Distro == "" {
+		return fmt.Errorf("Missing distro name for lxc driver")
 	}
-	if config.Release == "" {
-		return nil, fmt.Errorf("Missing release name for lxc driver")
+	if executor.config.Release == "" {
+		return fmt.Errorf("Missing release name for lxc driver")
 	}
-	if config.Arch == "" {
-		return nil, fmt.Errorf("Missing arch name for lxc driver")
+	if executor.config.Arch == "" {
+		return fmt.Errorf("Missing arch name for lxc driver")
 	}
 	options := lxc.TemplateOptions{
-		Template:             config.Template,
-		Distro:               config.Distro,
-		Release:              config.Release,
-		Arch:                 config.Arch,
+		Template:             executor.config.Template,
+		Distro:               executor.config.Distro,
+		Release:              executor.config.Release,
+		Arch:                 executor.config.Arch,
 		FlushCache:           false,
 		DisableGPGValidation: false,
 	}
-	c, err := lxc.NewContainer(config.Name, config.LXCPath)
+	c, err := lxc.NewContainer(executor.config.Name, executor.config.LXCPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := c.Create(options); err != nil {
-		return nil, err
+		return err
 	}
-	return c, nil
+	executor.container = c
+	return nil
 }
 
-func createByCloning(config *LXCExecutorConfig) (*lxc.Container, error) {
-	c, err := lxc.NewContainer(config.CloneFrom, config.LXCPath)
+func (executor *LXCExecutor) createByCloning() error {
+	c, err := lxc.NewContainer(executor.config.CloneFrom, executor.config.LXCPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := c.Clone(config.Name, lxc.DefaultCloneOptions); err != nil {
-		return nil, err
+	if err := c.Clone(executor.config.Name, lxc.DefaultCloneOptions); err != nil {
+		return err
 	}
-	c1, err1 := lxc.NewContainer(config.Name, config.LXCPath)
+	c1, err1 := lxc.NewContainer(executor.config.Name, executor.config.LXCPath)
 	if err1 != nil {
-		return nil, err1
+		return err1
 	}
-	return c1, nil
+	executor.container = c1
+	return nil
 }
 
-func CreateLXCContainer(config *LXCExecutorConfig) (*lxc.Container, error) {
-	if config.LXCPath == "" {
-		config.LXCPath = lxc.DefaultConfigPath()
+func (executor *LXCExecutor) Create() error {
+	if executor.config.LXCPath == "" {
+		executor.config.LXCPath = lxc.DefaultConfigPath()
 	}
-	if config.Name == "" {
-		return nil, fmt.Errorf("Missing container name for lxc driver")
+	if executor.config.Name == "" {
+		executor.config.Name = structs.GenerateUUID()
 	}
-	var container *lxc.Container
-	if config.CloneFrom == "" {
-		c, err := createFromTemplate(config)
-		if err != nil {
-			return nil, err
+	executor.logger.Printf("Assigned container name :%s\n", executor.config.Name)
+	if executor.config.CloneFrom == "" {
+		if err := executor.createFromTemplate(); err != nil {
+			return err
 		}
-		container = c
 	} else {
-		c, err := createByCloning(config)
-		if err != nil {
-			return nil, err
-		}
-		container = c
-	}
-	for k, v := range config.CgroupItems {
-		if err := container.SetCgroupItem(k, v); err != nil {
-			return nil, err
+		if err := executor.createByCloning(); err != nil {
+			return err
 		}
 	}
-	for k, v := range config.ConfigItems {
-		if err := container.SetConfigItem(k, v); err != nil {
-			return nil, err
+	for k, v := range executor.config.CgroupItems {
+		if err := executor.container.SetCgroupItem(k, v); err != nil {
+			return err
 		}
 	}
-	return container, nil
+	for k, v := range executor.config.ConfigItems {
+		if err := executor.container.SetConfigItem(k, v); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *LXCExecutor) Wait() *cstructs.WaitResult {
