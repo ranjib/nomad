@@ -40,13 +40,12 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	if err := mapstructure.WeakDecode(task.Config, &config); err != nil {
 		return nil, err
 	}
-	executor, e := NewLXCExecutor(&config, d.logger)
-	d.logger.Printf("[DEBUG] Using lxc name: %s", config.Name)
-	//envVars := TaskEnvironmentVariables(ctx, task)
-	if e != nil {
-		d.logger.Printf("[ERROR] failed to create container: %s", e)
-		return nil, e
+	executor := NewLXCExecutor(&config, d.logger)
+	if err := executor.Create(); err != nil {
+		d.logger.Printf("[ERROR] failed to create container: %s", err)
+		return nil, err
 	}
+	//envVars := TaskEnvironmentVariables(ctx, task)
 	d.logger.Printf("[DEBUG] Successfully created container: %s", config.Name)
 	h := &lxcHandle{
 		Name:     config.Name,

@@ -22,6 +22,22 @@ type LXCExecutorConfig struct {
 	ConfigItems map[string]string `mapstructure:"config_items"`
 }
 
+func (config *LXCExecutorConfig) ValidateTemplate() error {
+	if config.Template == "" {
+		return fmt.Errorf("Missing template name for lxc driver")
+	}
+	if config.Distro == "" {
+		return fmt.Errorf("Missing distro name for lxc driver")
+	}
+	if config.Release == "" {
+		return fmt.Errorf("Missing release name for lxc driver")
+	}
+	if config.Arch == "" {
+		return fmt.Errorf("Missing arch name for lxc driver")
+	}
+	return nil
+}
+
 type LXCExecutor struct {
 	logger    *log.Logger
 	container *lxc.Container
@@ -32,30 +48,16 @@ func (e *LXCExecutor) Container() *lxc.Container {
 	return e.container
 }
 
-func NewLXCExecutor(config *LXCExecutorConfig, logger *log.Logger) (*LXCExecutor, error) {
-	executor := LXCExecutor{
+func NewLXCExecutor(config *LXCExecutorConfig, logger *log.Logger) *LXCExecutor {
+	return &LXCExecutor{
 		config: config,
 		logger: logger,
 	}
-	if err := executor.Create(); err != nil {
-		logger.Printf("[ERROR] failed to create container: %s", err)
-		return nil, err
-	}
-	return &executor, nil
 }
 
 func (executor *LXCExecutor) createFromTemplate() error {
-	if executor.config.Template == "" {
-		return fmt.Errorf("Missing template name for lxc driver")
-	}
-	if executor.config.Distro == "" {
-		return fmt.Errorf("Missing distro name for lxc driver")
-	}
-	if executor.config.Release == "" {
-		return fmt.Errorf("Missing release name for lxc driver")
-	}
-	if executor.config.Arch == "" {
-		return fmt.Errorf("Missing arch name for lxc driver")
+	if err := executor.config.ValidateTemplate(); err != nil {
+		return err
 	}
 	options := lxc.TemplateOptions{
 		Template:             executor.config.Template,
