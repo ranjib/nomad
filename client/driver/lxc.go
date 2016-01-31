@@ -45,6 +45,10 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		d.logger.Printf("[ERROR] failed to create container: %s", err)
 		return nil, err
 	}
+	if err := executor.SetupBindMounts(ctx.AllocDir, task.Name); err != nil {
+		d.logger.Printf("[ERROR] failed to setup bind mounts: %s", err)
+		return nil, err
+	}
 	//envVars := TaskEnvironmentVariables(ctx, task)
 	d.logger.Printf("[DEBUG] Successfully created container: %s", config.Name)
 	h := &lxcHandle{
@@ -61,7 +65,7 @@ func (d *LXCDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	}
 
 	if err := h.executor.Start(); err != nil {
-		d.logger.Printf("[WARN] Failed to start container %s", err)
+		d.logger.Printf("[ERROR] Failed to start container %s", err)
 		return nil, err
 	}
 	go h.run()

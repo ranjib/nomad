@@ -2,6 +2,7 @@ package driver
 
 import (
 	"fmt"
+	"github.com/hashicorp/nomad/client/allocdir"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/nomad/structs"
 	lxc "gopkg.in/lxc/go-lxc.v2"
@@ -101,7 +102,7 @@ func (executor *LXCExecutor) Create() error {
 	if executor.config.Name == "" {
 		executor.config.Name = structs.GenerateUUID()
 	}
-	executor.logger.Printf("Assigned container name :%s\n", executor.config.Name)
+	executor.logger.Printf("[DEBUG] Assigned container name: %s\n", executor.config.Name)
 	if executor.config.CloneFrom == "" {
 		if err := executor.createFromTemplate(); err != nil {
 			return err
@@ -121,7 +122,25 @@ func (executor *LXCExecutor) Create() error {
 			return err
 		}
 	}
-	return nil
+	return executor.container.SaveConfigFile(executor.container.ConfigFileName())
+}
+
+func (executor *LXCExecutor) SetupBindMounts(alloc *allocdir.AllocDir, task string) error {
+	shared := alloc.SharedDir
+	local, ok := alloc.TaskDirs[task]
+	if !ok {
+		return fmt.Errorf("Failed to find task local directory: '%s'", task)
+	}
+	options := "none bind,create=dir 0 0"
+	localMountEntry := fmt.Sprintf("%s %s %s", local, allocdir.TaskLocal, options)
+	sharedMountEntry := fmt.Sprintf("%s %s %s", shared, allocdir.SharedAllocName, options)
+	if err := executor.container.SetConfigItem("lxc.mount.entry", localMountEntry); err != nil {
+		return err
+	}
+	if err := executor.container.SetConfigItem("lxc.mount.entry", sharedMountEntry); err != nil {
+		return err
+	}
+	return executor.container.SaveConfigFile(executor.container.ConfigFileName())
 }
 
 func (e *LXCExecutor) Wait() *cstructs.WaitResult {
