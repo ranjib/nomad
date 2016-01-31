@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 	lxc "gopkg.in/lxc/go-lxc.v2"
 	"log"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -131,9 +132,17 @@ func (executor *LXCExecutor) SetupBindMounts(alloc *allocdir.AllocDir, task stri
 	if !ok {
 		return fmt.Errorf("Failed to find task local directory: '%s'", task)
 	}
+	absLocal, err := filepath.Abs(local)
+	if err != nil {
+		return err
+	}
+	absShared, err := filepath.Abs(shared)
+	if err != nil {
+		return err
+	}
 	options := "none bind,create=dir 0 0"
-	localMountEntry := fmt.Sprintf("%s %s %s", local, allocdir.TaskLocal, options)
-	sharedMountEntry := fmt.Sprintf("%s %s %s", shared, allocdir.SharedAllocName, options)
+	localMountEntry := fmt.Sprintf("%s %s %s", absLocal, allocdir.TaskLocal, options)
+	sharedMountEntry := fmt.Sprintf("%s %s %s", absShared, allocdir.SharedAllocName, options)
 	if err := executor.container.SetConfigItem("lxc.mount.entry", localMountEntry); err != nil {
 		return err
 	}
