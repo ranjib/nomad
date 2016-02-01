@@ -140,7 +140,7 @@ func (executor *LXCExecutor) SetupBindMounts(alloc *allocdir.AllocDir, task stri
 	if err != nil {
 		return err
 	}
-	options := "none bind,create=dir 0 0"
+	options := "none bind,create=dir,rw 0 0"
 	localMountEntry := fmt.Sprintf("%s %s %s", absLocal, allocdir.TaskLocal, options)
 	sharedMountEntry := fmt.Sprintf("%s %s %s", absShared, allocdir.SharedAllocName, options)
 	if err := executor.container.SetConfigItem("lxc.mount.entry", localMountEntry); err != nil {
