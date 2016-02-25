@@ -57,6 +57,16 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"executor": func() (cli.Command, error) {
+			return &command.ExecutorPluginCommand{
+				Meta: meta,
+			}, nil
+		},
+		"fs": func() (cli.Command, error) {
+			return &command.FSCommand{
+				Meta: meta,
+			}, nil
+		},
 		"fs ls": func() (cli.Command, error) {
 			return &command.FSListCommand{
 				Meta: meta,
@@ -95,7 +105,11 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
+		"syslog": func() (cli.Command, error) {
+			return &command.SyslogPluginCommand{
+				Meta: meta,
+			}, nil
+		},
 		"server-force-leave": func() (cli.Command, error) {
 			return &command.ServerForceLeaveCommand{
 				Meta: meta,
@@ -113,13 +127,6 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
-		"spawn-daemon": func() (cli.Command, error) {
-			return &command.SpawnDaemonCommand{
-				Meta: meta,
-			}, nil
-		},
-
 		"status": func() (cli.Command, error) {
 			return &command.StatusCommand{
 				Meta: meta,

@@ -1,10 +1,13 @@
 package driver
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,7 +25,9 @@ func TestExecDriver_Fingerprint(t *testing.T) {
 	driverCtx, _ := testDriverContexts(&structs.Task{Name: "foo"})
 	d := NewExecDriver(driverCtx)
 	node := &structs.Node{
-		Attributes: make(map[string]string),
+		Attributes: map[string]string{
+			"unique.cgroup.mountpoint": "/sys/fs/cgroup",
+		},
 	}
 	apply, err := d.Fingerprint(&config.Config{}, node)
 	if err != nil {
@@ -44,6 +49,10 @@ func TestExecDriver_StartOpen_Wait(t *testing.T) {
 		Config: map[string]interface{}{
 			"command": "/bin/sleep",
 			"args":    []string{"5"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -68,6 +77,70 @@ func TestExecDriver_StartOpen_Wait(t *testing.T) {
 	if handle2 == nil {
 		t.Fatalf("missing handle")
 	}
+
+	handle.Kill()
+	handle2.Kill()
+}
+
+func TestExecDriver_KillUserPid_OnPluginReconnectFailure(t *testing.T) {
+	t.Parallel()
+	ctestutils.ExecCompatible(t)
+	task := &structs.Task{
+		Name: "sleep",
+		Config: map[string]interface{}{
+			"command": "/bin/sleep",
+			"args":    []string{"1000000"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: basicResources,
+	}
+
+	driverCtx, execCtx := testDriverContexts(task)
+	defer execCtx.AllocDir.Destroy()
+	d := NewExecDriver(driverCtx)
+
+	handle, err := d.Start(execCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("missing handle")
+	}
+	defer handle.Kill()
+
+	id := &execId{}
+	if err := json.Unmarshal([]byte(handle.ID()), id); err != nil {
+		t.Fatalf("Failed to parse handle '%s': %v", handle.ID(), err)
+	}
+	pluginPid := id.PluginConfig.Pid
+	proc, err := os.FindProcess(pluginPid)
+	if err != nil {
+		t.Fatalf("can't find plugin pid: %v", pluginPid)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatalf("can't kill plugin pid: %v", err)
+	}
+
+	// Attempt to open
+	handle2, err := d.Open(execCtx, handle.ID())
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if handle2 != nil {
+		handle2.Kill()
+		t.Fatalf("expected handle2 to be nil")
+	}
+	// Test if the userpid is still present
+	userProc, err := os.FindProcess(id.UserPid)
+
+	err = userProc.Signal(syscall.Signal(0))
+
+	if err == nil {
+		t.Fatalf("expected user process to die")
+	}
 }
 
 func TestExecDriver_Start_Wait(t *testing.T) {
@@ -78,6 +151,10 @@ func TestExecDriver_Start_Wait(t *testing.T) {
 		Config: map[string]interface{}{
 			"command": "/bin/sleep",
 			"args":    []string{"2"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -121,7 +198,11 @@ func TestExecDriver_Start_Artifact_basic(t *testing.T) {
 		Name: "sleep",
 		Config: map[string]interface{}{
 			"artifact_source": fmt.Sprintf("https://dl.dropboxusercontent.com/u/47675/jar_thing/%s?checksum=%s", file, checksum),
-			"command":         filepath.Join("$NOMAD_TASK_DIR", file),
+			"command":         file,
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -155,52 +236,6 @@ func TestExecDriver_Start_Artifact_basic(t *testing.T) {
 	}
 }
 
-func TestExecDriver_Start_Artifact_expanded(t *testing.T) {
-	t.Parallel()
-	ctestutils.ExecCompatible(t)
-	file := "hi_linux_amd64"
-
-	task := &structs.Task{
-		Name: "sleep",
-		Config: map[string]interface{}{
-			"artifact_source": fmt.Sprintf("https://dl.dropboxusercontent.com/u/47675/jar_thing/%s", file),
-			"command":         "/bin/bash",
-			"args": []string{
-				"-c",
-				fmt.Sprintf(`/bin/sleep 1 && %s`, filepath.Join("$NOMAD_TASK_DIR", file)),
-			},
-		},
-		Resources: basicResources,
-	}
-
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewExecDriver(driverCtx)
-
-	handle, err := d.Start(execCtx, task)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if handle == nil {
-		t.Fatalf("missing handle")
-	}
-
-	// Update should be a no-op
-	err = handle.Update(task)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Task should terminate quickly
-	select {
-	case res := <-handle.WaitCh():
-		if !res.Successful() {
-			t.Fatalf("err: %v", res)
-		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
-		t.Fatalf("timeout")
-	}
-}
 func TestExecDriver_Start_Wait_AllocDir(t *testing.T) {
 	t.Parallel()
 	ctestutils.ExecCompatible(t)
@@ -213,8 +248,12 @@ func TestExecDriver_Start_Wait_AllocDir(t *testing.T) {
 			"command": "/bin/bash",
 			"args": []string{
 				"-c",
-				fmt.Sprintf(`sleep 1; echo -n %s > $%s/%s`, string(exp), env.AllocDir, file),
+				fmt.Sprintf(`sleep 1; echo -n %s > ${%s}/%s`, string(exp), env.AllocDir, file),
 			},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -260,9 +299,14 @@ func TestExecDriver_Start_Kill_Wait(t *testing.T) {
 		Name: "sleep",
 		Config: map[string]interface{}{
 			"command": "/bin/sleep",
-			"args":    []string{"1"},
+			"args":    []string{"100"},
 		},
-		Resources: basicResources,
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources:   basicResources,
+		KillTimeout: 10 * time.Second,
 	}
 
 	driverCtx, execCtx := testDriverContexts(task)

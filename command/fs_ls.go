@@ -3,6 +3,8 @@ package command
 import (
 	"fmt"
 	"strings"
+
+	"github.com/dustin/go-humanize"
 )
 
 type FSListCommand struct {
@@ -11,7 +13,7 @@ type FSListCommand struct {
 
 func (f *FSListCommand) Help() string {
 	helpText := `
-Usage: nomad fs-ls <alloc-id> <path>
+Usage: nomad fs ls <alloc-id> <path>
 
 	ls displays the contents of the allocation directory for the passed allocation. The path 
 	is relative to the root of the alloc dir and defaults to root if unspecified.
@@ -19,6 +21,11 @@ Usage: nomad fs-ls <alloc-id> <path>
 	General Options:
 
   ` + generalOptionsUsage() + `
+
+Ls Options:
+
+  -H
+    Machine friendly output.
 
   -verbose
     Show full information.
@@ -28,14 +35,16 @@ Usage: nomad fs-ls <alloc-id> <path>
 }
 
 func (f *FSListCommand) Synopsis() string {
-	return "Lists list of files of an allocation directory"
+	return "List files in an allocation directory"
 }
 
 func (f *FSListCommand) Run(args []string) int {
 	var verbose bool
+	var machine bool
 	flags := f.Meta.FlagSet("fs-list", FlagSetClient)
 	flags.Usage = func() { f.Ui.Output(f.Help()) }
 	flags.BoolVar(&verbose, "verbose", false, "")
+	flags.BoolVar(&machine, "H", false, "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -126,9 +135,15 @@ func (f *FSListCommand) Run(args []string) int {
 		if file.IsDir {
 			fn = fmt.Sprintf("%s/", fn)
 		}
-		out[i+1] = fmt.Sprintf("%s|%d|%s|%s",
+		var size string
+		if machine {
+			size = fmt.Sprintf("%d", file.Size)
+		} else {
+			size = humanize.Bytes(uint64(file.Size))
+		}
+		out[i+1] = fmt.Sprintf("%s|%s|%s|%s",
 			file.FileMode,
-			file.Size,
+			size,
 			formatTime(file.ModTime),
 			fn,
 		)

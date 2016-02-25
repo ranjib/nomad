@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -275,6 +276,7 @@ func (c *Command) setupLoggers(config *Config) (*gatedwriter.Writer, *logWriter,
 		logOutput = io.MultiWriter(c.logFilter, logWriter)
 	}
 	c.logOutput = logOutput
+	log.SetOutput(logOutput)
 	return logGate, logWriter, logOutput
 }
 
@@ -650,7 +652,7 @@ func (c *Command) retryJoin(config *Config) {
 
 		attempt++
 		if config.Server.RetryMaxAttempts > 0 && attempt > config.Server.RetryMaxAttempts {
-			logger.Printf("[ERROR] agent: max join retry exhausted, exiting")
+			logger.Printf("[ERR] agent: max join retry exhausted, exiting")
 			close(c.retryJoinErrCh)
 			return
 		}

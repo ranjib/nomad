@@ -98,10 +98,14 @@ WAIT:
 // previously inflight transactions have been commited and that our
 // state is up-to-date.
 func (s *Server) establishLeadership(stopCh chan struct{}) error {
-	// If we have multiple workers, disable one to free processing
-	// for the plan queue and evaluation broker
-	if len(s.workers) > 1 {
-		s.workers[0].SetPause(true)
+	// Disable workers to free half the cores for use in the plan queue and
+	// evaluation broker
+	if numWorkers := len(s.workers); numWorkers > 1 {
+		// Disabling 3/4 of the workers frees CPU for raft and the
+		// plan applier which uses 1/2 the cores.
+		for i := 0; i < (3 * numWorkers / 4); i++ {
+			s.workers[i].SetPause(true)
+		}
 	}
 
 	// Enable the plan queue, since we are now the leader
@@ -113,8 +117,11 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Enable the eval broker, since we are now the leader
 	s.evalBroker.SetEnabled(true)
 
+	// Enable the blocked eval tracker, since we are now the leader
+	s.blockedEvals.SetEnabled(true)
+
 	// Restore the eval broker state
-	if err := s.restoreEvalBroker(); err != nil {
+	if err := s.restoreEvals(); err != nil {
 		return err
 	}
 
@@ -133,6 +140,9 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Reap any failed evaluations
 	go s.reapFailedEvaluations(stopCh)
 
+	// Reap any duplicate blocked evaluations
+	go s.reapDupBlockedEvaluations(stopCh)
+
 	// Setup the heartbeat timers. This is done both when starting up or when
 	// a leader fail over happens. Since the timers are maintained by the leader
 	// node, effectively this means all the timers are renewed at the time of failover.
@@ -149,10 +159,11 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	return nil
 }
 
-// restoreEvalBroker is used to restore all pending evaluations
-// into the eval broker. The broker is maintained only by the leader,
-// so it must be restored anytime a leadership transition takes place.
-func (s *Server) restoreEvalBroker() error {
+// restoreEvals is used to restore pending evaluations into the eval broker and
+// blocked evaluations into the blocked eval tracker. The broker and blocked
+// eval tracker is maintained only by the leader, so it must be restored anytime
+// a leadership transition takes place.
+func (s *Server) restoreEvals() error {
 	// Get an iterator over every evaluation
 	iter, err := s.fsm.State().Evals()
 	if err != nil {
@@ -166,12 +177,12 @@ func (s *Server) restoreEvalBroker() error {
 		}
 		eval := raw.(*structs.Evaluation)
 
-		if !eval.ShouldEnqueue() {
-			continue
-		}
-
-		if err := s.evalBroker.Enqueue(eval); err != nil {
-			return fmt.Errorf("failed to enqueue evaluation %s: %v", eval.ID, err)
+		if eval.ShouldEnqueue() {
+			if err := s.evalBroker.Enqueue(eval); err != nil {
+				return fmt.Errorf("failed to enqueue evaluation %s: %v", eval.ID, err)
+			}
+		} else if eval.ShouldBlock() {
+			s.blockedEvals.Block(eval)
 		}
 	}
 	return nil
@@ -259,6 +270,14 @@ func (s *Server) coreJobEval(job string) *structs.Evaluation {
 	}
 }
 
+// forceCoreJobEval returns an evaluation for a core job that will ignore GC
+// cutoffs.
+func (s *Server) forceCoreJobEval(job string) *structs.Evaluation {
+	eval := s.coreJobEval(job)
+	eval.TriggeredBy = structs.EvalTriggerForceGC
+	return eval
+}
+
 // reapFailedEvaluations is used to reap evaluations that
 // have reached their delivery limit and should be failed
 func (s *Server) reapFailedEvaluations(stopCh chan struct{}) {
@@ -297,6 +316,41 @@ func (s *Server) reapFailedEvaluations(stopCh chan struct{}) {
 	}
 }
 
+// reapDupBlockedEvaluations is used to reap duplicate blocked evaluations and
+// should be cancelled.
+func (s *Server) reapDupBlockedEvaluations(stopCh chan struct{}) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			// Scan for duplicate blocked evals.
+			dups := s.blockedEvals.GetDuplicates(time.Second)
+			if dups == nil {
+				continue
+			}
+
+			cancel := make([]*structs.Evaluation, len(dups))
+			for i, dup := range dups {
+				// Update the status to cancelled
+				newEval := dup.Copy()
+				newEval.Status = structs.EvalStatusCancelled
+				newEval.StatusDescription = fmt.Sprintf("existing blocked evaluation exists for job %q", newEval.JobID)
+				cancel[i] = newEval
+			}
+
+			// Update via Raft
+			req := structs.EvalUpdateRequest{
+				Evals: cancel,
+			}
+			if _, _, err := s.raftApply(structs.EvalUpdateRequestType, &req); err != nil {
+				s.logger.Printf("[ERR] nomad: failed to update duplicate evals %#v: %v", cancel, err)
+				continue
+			}
+		}
+	}
+}
+
 // revokeLeadership is invoked once we step down as leader.
 // This is used to cleanup any state that may be specific to a leader.
 func (s *Server) revokeLeadership() error {
@@ -305,6 +359,9 @@ func (s *Server) revokeLeadership() error {
 
 	// Disable the eval broker, since it is only useful as a leader
 	s.evalBroker.SetEnabled(false)
+
+	// Disable the blocked eval tracker, since it is only useful as a leader
+	s.blockedEvals.SetEnabled(false)
 
 	// Disable the periodic dispatcher, since it is only useful as a leader
 	s.periodicDispatcher.SetEnabled(false)
@@ -318,7 +375,9 @@ func (s *Server) revokeLeadership() error {
 
 	// Unpause our worker if we paused previously
 	if len(s.workers) > 1 {
-		s.workers[0].SetPause(false)
+		for i := 0; i < len(s.workers)/2; i++ {
+			s.workers[i].SetPause(false)
+		}
 	}
 	return nil
 }

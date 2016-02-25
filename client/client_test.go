@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
+	"github.com/mitchellh/hashstructure"
 
 	ctestutil "github.com/hashicorp/nomad/client/testutil"
 )
@@ -137,6 +138,37 @@ func TestClient_Fingerprint(t *testing.T) {
 	}
 	if node.Attributes["arch"] == "" {
 		t.Fatalf("missing arch")
+	}
+}
+
+func TestClient_HasNodeChanged(t *testing.T) {
+	c := testClient(t, nil)
+	defer c.Shutdown()
+
+	node := c.Node()
+	attrHash, err := hashstructure.Hash(node.Attributes, nil)
+	if err != nil {
+		c.logger.Printf("[DEBUG] client: unable to calculate node attributes hash: %v", err)
+	}
+	// Calculate node meta map hash
+	metaHash, err := hashstructure.Hash(node.Meta, nil)
+	if err != nil {
+		c.logger.Printf("[DEBUG] client: unable to calculate node meta hash: %v", err)
+	}
+	if changed, _, _ := c.hasNodeChanged(attrHash, metaHash); changed {
+		t.Fatalf("Unexpected hash change.")
+	}
+
+	// Change node attribute
+	node.Attributes["arch"] = "xyz_86"
+	if changed, newAttrHash, _ := c.hasNodeChanged(attrHash, metaHash); !changed {
+		t.Fatalf("Expected hash change in attributes: %d vs %d", attrHash, newAttrHash)
+	}
+
+	// Change node meta map
+	node.Meta["foo"] = "bar"
+	if changed, _, newMetaHash := c.hasNodeChanged(attrHash, metaHash); !changed {
+		t.Fatalf("Expected hash change in meta map: %d vs %d", metaHash, newMetaHash)
 	}
 }
 
@@ -292,27 +324,27 @@ func TestClient_UpdateAllocStatus(t *testing.T) {
 
 	alloc := mock.Alloc()
 	alloc.NodeID = c1.Node().ID
+	originalStatus := "foo"
+	alloc.ClientStatus = originalStatus
 
 	state := s1.State()
 	state.UpsertAllocs(100, []*structs.Allocation{alloc})
 
-	newAlloc := new(structs.Allocation)
-	*newAlloc = *alloc
-	newAlloc.ClientStatus = structs.AllocClientStatusRunning
-
-	err := c1.updateAllocStatus(newAlloc)
-	if err != nil {
+	testutil.WaitForResult(func() (bool, error) {
+		out, err := state.AllocByID(alloc.ID)
+		if err != nil {
+			return false, err
+		}
+		if out == nil {
+			return false, fmt.Errorf("no such alloc")
+		}
+		if out.ClientStatus == originalStatus {
+			return false, fmt.Errorf("Alloc client status not updated; got %v", out.ClientStatus)
+		}
+		return true, nil
+	}, func(err error) {
 		t.Fatalf("err: %v", err)
-	}
-
-	out, err := state.AllocByID(alloc.ID)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	if out == nil || out.ClientStatus != structs.AllocClientStatusRunning {
-		t.Fatalf("bad: %#v", out)
-	}
+	})
 }
 
 func TestClient_WatchAllocs(t *testing.T) {
@@ -355,10 +387,14 @@ func TestClient_WatchAllocs(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Update the other allocation
-	alloc2.DesiredStatus = structs.AllocDesiredStatusStop
+	// Update the other allocation. Have to make a copy because the allocs are
+	// shared in memory in the test and the modify index would be updated in the
+	// alloc runner.
+	alloc2_2 := new(structs.Allocation)
+	*alloc2_2 = *alloc2
+	alloc2_2.DesiredStatus = structs.AllocDesiredStatusStop
 	err = state.UpsertAllocs(102,
-		[]*structs.Allocation{alloc2})
+		[]*structs.Allocation{alloc2_2})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -404,8 +440,7 @@ func TestClient_SaveRestoreState(t *testing.T) {
 	task.Config["args"] = []string{"10"}
 
 	state := s1.State()
-	err := state.UpsertAllocs(100,
-		[]*structs.Allocation{alloc1})
+	err := state.UpsertAllocs(100, []*structs.Allocation{alloc1})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -434,12 +469,20 @@ func TestClient_SaveRestoreState(t *testing.T) {
 	defer c2.Shutdown()
 
 	// Ensure the allocation is running
-	c2.allocLock.RLock()
-	ar := c2.allocs[alloc1.ID]
-	c2.allocLock.RUnlock()
-	if ar.Alloc().ClientStatus != structs.AllocClientStatusRunning {
-		t.Fatalf("bad: %#v", ar.Alloc())
-	}
+	testutil.WaitForResult(func() (bool, error) {
+		c2.allocLock.RLock()
+		ar := c2.allocs[alloc1.ID]
+		c2.allocLock.RUnlock()
+		status := ar.Alloc().ClientStatus
+		alive := status != structs.AllocClientStatusRunning ||
+			status != structs.AllocClientStatusPending
+		if !alive {
+			return false, fmt.Errorf("incorrect client status: %#v", ar.Alloc())
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
 }
 
 func TestClient_Init(t *testing.T) {
@@ -475,28 +518,28 @@ func TestClient_SetServers(t *testing.T) {
 	}
 
 	// Set the initial servers list
-	expect := []string{"foo"}
+	expect := []string{"foo:4647"}
 	client.SetServers(expect)
 	if !reflect.DeepEqual(client.servers, expect) {
 		t.Fatalf("expect %v, got %v", expect, client.servers)
 	}
 
 	// Add a server
-	expect = []string{"foo", "bar"}
+	expect = []string{"foo:5445", "bar:8080"}
 	client.SetServers(expect)
 	if !reflect.DeepEqual(client.servers, expect) {
 		t.Fatalf("expect %v, got %v", expect, client.servers)
 	}
 
 	// Remove a server
-	expect = []string{"bar"}
+	expect = []string{"bar:8080"}
 	client.SetServers(expect)
 	if !reflect.DeepEqual(client.servers, expect) {
 		t.Fatalf("expect %v, got %v", expect, client.servers)
 	}
 
 	// Add and remove a server
-	expect = []string{"baz", "zip"}
+	expect = []string{"baz:9090", "zip:4545"}
 	client.SetServers(expect)
 	if !reflect.DeepEqual(client.servers, expect) {
 		t.Fatalf("expect %v, got %v", expect, client.servers)
@@ -505,5 +548,13 @@ func TestClient_SetServers(t *testing.T) {
 	// Query the servers list
 	if servers := client.Servers(); !reflect.DeepEqual(servers, expect) {
 		t.Fatalf("expect %v, got %v", expect, servers)
+	}
+
+	// Add servers without ports, and remove old servers
+	servers := []string{"foo", "bar", "baz"}
+	expect = []string{"foo:4647", "bar:4647", "baz:4647"}
+	client.SetServers(servers)
+	if !reflect.DeepEqual(client.servers, expect) {
+		t.Fatalf("expect %v, got %v", expect, client.servers)
 	}
 }

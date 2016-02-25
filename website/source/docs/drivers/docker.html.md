@@ -39,12 +39,12 @@ The following options are available for use in the job specification.
 
 *   `args` - (Optional) A list of arguments to the optional `command`. If no
     `command` is present, `args` are ignored. References to environment variables
-    or any [intepretable Nomad
-    variables](/docs/jobspec/index.html#interpreted_vars) will be interpreted
+    or any [interpretable Nomad
+    variables](/docs/jobspec/interpreted.html) will be interpreted
     before launching the task. For example:
 
     ```
-        args = ["$nomad.ip", "$MY_ENV", "$meta.foo"]
+        args = ["${nomad.datacenter}", "${MY_ENV}", "${meta.foo}"]
     ```
 
 * `labels` - (Optional) A key/value map of labels to set to the containers on
@@ -246,6 +246,9 @@ The `docker` driver has the following host-level configuration options:
 * `docker.endpoint` - Defaults to `unix:///var/run/docker.sock`. You will need
   to customize this if you use a non-standard socket (http or another
   location).
+
+* `docker.auth.config` - Allows an operator to specify a json file which is in
+  the dockercfg format containing authentication information for private registry. 
 
 * `docker.tls.cert` - Path to the server's certificate file (`.pem`). Specify
   this along with `docker.tls.key` and `docker.tls.ca` to use a TLS client to

@@ -104,6 +104,11 @@ func TestServiceSched_JobRegister_AllocFail(t *testing.T) {
 	}
 	plan := h.Plans[0]
 
+	// Ensure the plan has created a follow up eval.
+	if len(h.CreateEvals) != 1 || h.CreateEvals[0].Status != structs.EvalStatusBlocked {
+		t.Fatalf("bad: %#v", h.CreateEvals)
+	}
+
 	// Ensure the plan failed to alloc
 	if len(plan.FailedAllocs) != 1 {
 		t.Fatalf("bad: %#v", plan)
@@ -126,6 +131,163 @@ func TestServiceSched_JobRegister_AllocFail(t *testing.T) {
 	// Check the available nodes
 	if count, ok := out[0].Metrics.NodesAvailable["dc1"]; !ok || count != 0 {
 		t.Fatalf("bad: %#v", out[0].Metrics)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
+func TestServiceSched_JobRegister_BlockedEval(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create a full node
+	node := mock.Node()
+	node.Reserved = node.Resources
+	node.ComputeClass()
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+
+	// Create an ineligible node
+	node2 := mock.Node()
+	node2.Attributes["kernel.name"] = "windows"
+	node2.ComputeClass()
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node2))
+
+	// Create a jobs
+	job := mock.Job()
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a mock evaluation to register the job
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewServiceScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure a single plan
+	if len(h.Plans) != 1 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+	plan := h.Plans[0]
+
+	// Ensure the plan has created a follow up eval.
+	if len(h.CreateEvals) != 1 {
+		t.Fatalf("bad: %#v", h.CreateEvals)
+	}
+
+	created := h.CreateEvals[0]
+	if created.Status != structs.EvalStatusBlocked {
+		t.Fatalf("bad: %#v", created)
+	}
+
+	classes := created.ClassEligibility
+	if len(classes) != 2 || !classes[node.ComputedClass] || classes[node2.ComputedClass] {
+		t.Fatalf("bad: %#v", classes)
+	}
+
+	if created.EscapedComputedClass {
+		t.Fatalf("bad: %#v", created)
+	}
+
+	// Ensure the plan failed to alloc
+	if len(plan.FailedAllocs) != 1 {
+		t.Fatalf("bad: %#v", plan)
+	}
+
+	// Lookup the allocations by JobID
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+
+	// Ensure all allocations placed
+	if len(out) != 1 {
+		for _, a := range out {
+			t.Logf("%#v", a)
+		}
+		t.Fatalf("bad: %#v", out)
+	}
+
+	// Check the coalesced failures
+	if out[0].Metrics.CoalescedFailures != 9 {
+		t.Fatalf("bad: %#v", out[0].Metrics)
+	}
+
+	// Check the available nodes
+	if count, ok := out[0].Metrics.NodesAvailable["dc1"]; !ok || count != 2 {
+		t.Fatalf("bad: %#v", out[0].Metrics)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
+func TestServiceSched_JobRegister_FeasibleAndInfeasibleTG(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create one node
+	node := mock.Node()
+	node.NodeClass = "class_0"
+	noErr(t, node.ComputeClass())
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+
+	// Create a job that constrains on a node class
+	job := mock.Job()
+	job.TaskGroups[0].Count = 2
+	job.TaskGroups[0].Constraints = append(job.Constraints,
+		&structs.Constraint{
+			LTarget: "${node.class}",
+			RTarget: "class_0",
+			Operand: "=",
+		},
+	)
+	tg2 := job.TaskGroups[0].Copy()
+	tg2.Name = "web2"
+	tg2.Constraints[1].RTarget = "class_1"
+	job.TaskGroups = append(job.TaskGroups, tg2)
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a mock evaluation to register the job
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewServiceScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure a single plan
+	if len(h.Plans) != 1 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+	plan := h.Plans[0]
+
+	// Ensure the plan allocated
+	var planned []*structs.Allocation
+	for _, allocList := range plan.NodeAllocation {
+		planned = append(planned, allocList...)
+	}
+	if len(planned) != 2 {
+		t.Fatalf("bad: %#v", plan)
+	}
+	if len(plan.FailedAllocs) != 1 {
+		t.Fatalf("bad: %#v", plan)
+	}
+
+	// Lookup the allocations by JobID
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+
+	// Ensure all allocations placed
+	if len(out) != 3 {
+		t.Fatalf("bad: %#v", out)
 	}
 
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
@@ -418,7 +580,7 @@ func TestServiceSched_JobModify_InPlace(t *testing.T) {
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
 
 	// Verify the network did not change
-	rp := structs.Port{"main", 5000}
+	rp := structs.Port{Label: "main", Value: 5000}
 	for _, alloc := range out {
 		for _, resources := range alloc.TaskResources {
 			if resources.Networks[0].ReservedPorts[0] != rp {
@@ -472,6 +634,13 @@ func TestServiceSched_JobDeregister(t *testing.T) {
 	out, err := h.State.AllocsByJob(job.ID)
 	noErr(t, err)
 
+	// Ensure that the job field on the allocation is still populated
+	for _, alloc := range out {
+		if alloc.Job == nil {
+			t.Fatalf("bad: %#v", alloc)
+		}
+	}
+
 	// Ensure no remaining allocations
 	out = structs.FilterTerminalAllocs(out)
 	if len(out) != 0 {
@@ -495,7 +664,7 @@ func TestServiceSched_NodeDrain(t *testing.T) {
 		noErr(t, h.State.UpsertNode(h.NextIndex(), node))
 	}
 
-	// Generate a fake job with allocations
+	// Generate a fake job with allocations and an update policy.
 	job := mock.Job()
 	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
 
@@ -558,6 +727,84 @@ func TestServiceSched_NodeDrain(t *testing.T) {
 	h.AssertEvalStatus(t, structs.EvalStatusComplete)
 }
 
+func TestServiceSched_NodeDrain_UpdateStrategy(t *testing.T) {
+	h := NewHarness(t)
+
+	// Register a draining node
+	node := mock.Node()
+	node.Drain = true
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+
+	// Create some nodes
+	for i := 0; i < 10; i++ {
+		node := mock.Node()
+		noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+	}
+
+	// Generate a fake job with allocations and an update policy.
+	job := mock.Job()
+	mp := 5
+	job.Update = structs.UpdateStrategy{
+		Stagger:     time.Second,
+		MaxParallel: mp,
+	}
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	var allocs []*structs.Allocation
+	for i := 0; i < 10; i++ {
+		alloc := mock.Alloc()
+		alloc.Job = job
+		alloc.JobID = job.ID
+		alloc.NodeID = node.ID
+		alloc.Name = fmt.Sprintf("my-job.web[%d]", i)
+		allocs = append(allocs, alloc)
+	}
+	noErr(t, h.State.UpsertAllocs(h.NextIndex(), allocs))
+
+	// Create a mock evaluation to deal with drain
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Priority:    50,
+		TriggeredBy: structs.EvalTriggerNodeUpdate,
+		JobID:       job.ID,
+		NodeID:      node.ID,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewServiceScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure a single plan
+	if len(h.Plans) != 1 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+	plan := h.Plans[0]
+
+	// Ensure the plan evicted all allocs
+	if len(plan.NodeUpdate[node.ID]) != mp {
+		t.Fatalf("bad: %#v", plan)
+	}
+
+	// Ensure the plan allocated
+	var planned []*structs.Allocation
+	for _, allocList := range plan.NodeAllocation {
+		planned = append(planned, allocList...)
+	}
+	if len(planned) != mp {
+		t.Fatalf("bad: %#v", plan)
+	}
+
+	// Ensure there is a followup eval.
+	if len(h.CreateEvals) != 1 ||
+		h.CreateEvals[0].TriggeredBy != structs.EvalTriggerRollingUpdate {
+		t.Fatalf("bad: %#v", h.CreateEvals)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
 func TestServiceSched_RetryLimit(t *testing.T) {
 	h := NewHarness(t)
 	h.Planner = &RejectPlan{h}
@@ -602,4 +849,108 @@ func TestServiceSched_RetryLimit(t *testing.T) {
 
 	// Should hit the retry limit
 	h.AssertEvalStatus(t, structs.EvalStatusFailed)
+}
+
+func TestBatchSched_Run_DeadAlloc(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create a node
+	node := mock.Node()
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+
+	// Create a job
+	job := mock.Job()
+	job.TaskGroups[0].Count = 1
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a failed alloc
+	alloc := mock.Alloc()
+	alloc.Job = job
+	alloc.JobID = job.ID
+	alloc.NodeID = node.ID
+	alloc.Name = "my-job.web[0]"
+	alloc.ClientStatus = structs.AllocClientStatusDead
+	noErr(t, h.State.UpsertAllocs(h.NextIndex(), []*structs.Allocation{alloc}))
+
+	// Create a mock evaluation to register the job
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewBatchScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure no plan as it should be a no-op
+	if len(h.Plans) != 0 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+
+	// Lookup the allocations by JobID
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+
+	// Ensure no allocations placed
+	if len(out) != 1 {
+		t.Fatalf("bad: %#v", out)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
+}
+
+func TestBatchSched_Run_FailedAlloc(t *testing.T) {
+	h := NewHarness(t)
+
+	// Create a node
+	node := mock.Node()
+	noErr(t, h.State.UpsertNode(h.NextIndex(), node))
+
+	// Create a job
+	job := mock.Job()
+	job.TaskGroups[0].Count = 1
+	noErr(t, h.State.UpsertJob(h.NextIndex(), job))
+
+	// Create a failed alloc
+	alloc := mock.Alloc()
+	alloc.Job = job
+	alloc.JobID = job.ID
+	alloc.NodeID = node.ID
+	alloc.Name = "my-job.web[0]"
+	alloc.ClientStatus = structs.AllocClientStatusFailed
+	noErr(t, h.State.UpsertAllocs(h.NextIndex(), []*structs.Allocation{alloc}))
+
+	// Create a mock evaluation to register the job
+	eval := &structs.Evaluation{
+		ID:          structs.GenerateUUID(),
+		Priority:    job.Priority,
+		TriggeredBy: structs.EvalTriggerJobRegister,
+		JobID:       job.ID,
+	}
+
+	// Process the evaluation
+	err := h.Process(NewBatchScheduler, eval)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure no plan as it should be a no-op
+	if len(h.Plans) != 1 {
+		t.Fatalf("bad: %#v", h.Plans)
+	}
+
+	// Lookup the allocations by JobID
+	out, err := h.State.AllocsByJob(job.ID)
+	noErr(t, err)
+
+	// Ensure a replacement alloc was placed.
+	if len(out) != 2 {
+		t.Fatalf("bad: %#v", out)
+	}
+
+	h.AssertEvalStatus(t, structs.EvalStatusComplete)
 }

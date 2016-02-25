@@ -2,9 +2,11 @@ package nomad
 
 import (
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/raft"
@@ -42,6 +44,14 @@ func (s *Server) planApply() {
 	var waitCh chan struct{}
 	var snap *state.StateSnapshot
 
+	// Setup a worker pool with half the cores, with at least 1
+	poolSize := runtime.NumCPU() / 2
+	if poolSize == 0 {
+		poolSize = 1
+	}
+	pool := NewEvaluatePool(poolSize, workerPoolBufferSize)
+	defer pool.Shutdown()
+
 	for {
 		// Pull the next pending plan, exit if we are no longer leader
 		pending, err := s.planQueue.Dequeue(0)
@@ -77,7 +87,7 @@ func (s *Server) planApply() {
 		}
 
 		// Evaluate the plan
-		result, err := evaluatePlan(snap, pending.plan)
+		result, err := evaluatePlan(pool, snap, pending.plan)
 		if err != nil {
 			s.logger.Printf("[ERR] nomad: failed to evaluate plan: %v", err)
 			pending.respond(nil, err)
@@ -103,7 +113,7 @@ func (s *Server) planApply() {
 		}
 
 		// Dispatch the Raft transaction for the plan
-		future, err := s.applyPlan(result, snap)
+		future, err := s.applyPlan(pending.plan.Job, result, snap)
 		if err != nil {
 			s.logger.Printf("[ERR] nomad: failed to submit plan: %v", err)
 			pending.respond(nil, err)
@@ -117,8 +127,18 @@ func (s *Server) planApply() {
 }
 
 // applyPlan is used to apply the plan result and to return the alloc index
-func (s *Server) applyPlan(result *structs.PlanResult, snap *state.StateSnapshot) (raft.ApplyFuture, error) {
-	req := structs.AllocUpdateRequest{}
+func (s *Server) applyPlan(job *structs.Job, result *structs.PlanResult, snap *state.StateSnapshot) (raft.ApplyFuture, error) {
+	// Determine the miniumum number of updates, could be more if there
+	// are multiple updates per node
+	minUpdates := len(result.NodeUpdate)
+	minUpdates += len(result.NodeAllocation)
+	minUpdates += len(result.FailedAllocs)
+
+	// Setup the update request
+	req := structs.AllocUpdateRequest{
+		Job:   job,
+		Alloc: make([]*structs.Allocation, 0, minUpdates),
+	}
 	for _, updateList := range result.NodeUpdate {
 		req.Alloc = append(req.Alloc, updateList...)
 	}
@@ -126,6 +146,15 @@ func (s *Server) applyPlan(result *structs.PlanResult, snap *state.StateSnapshot
 		req.Alloc = append(req.Alloc, allocList...)
 	}
 	req.Alloc = append(req.Alloc, result.FailedAllocs...)
+
+	// Set the time the alloc was applied for the first time. This can be used
+	// to approximate the scheduling time.
+	now := time.Now().UTC().UnixNano()
+	for _, alloc := range req.Alloc {
+		if alloc.CreateTime == 0 {
+			alloc.CreateTime = now
+		}
+	}
 
 	// Dispatch the Raft transaction
 	future, err := s.raftApplyFuture(structs.AllocUpdateRequestType, &req)
@@ -158,13 +187,21 @@ func (s *Server) asyncPlanWait(waitCh chan struct{}, future raft.ApplyFuture,
 
 	// Respond to the plan
 	result.AllocIndex = future.Index()
+
+	// If this is a partial plan application, we need to ensure the scheduler
+	// at least has visibility into any placements it made to avoid double placement.
+	// The RefreshIndex computed by evaluatePlan may be stale due to evaluation
+	// against an optimistic copy of the state.
+	if result.RefreshIndex != 0 {
+		result.RefreshIndex = maxUint64(result.RefreshIndex, result.AllocIndex)
+	}
 	pending.respond(result, nil)
 }
 
 // evaluatePlan is used to determine what portions of a plan
 // can be applied if any. Returns if there should be a plan application
 // which may be partial or if there was an error
-func evaluatePlan(snap *state.StateSnapshot, plan *structs.Plan) (*structs.PlanResult, error) {
+func evaluatePlan(pool *EvaluatePool, snap *state.StateSnapshot, plan *structs.Plan) (*structs.PlanResult, error) {
 	defer metrics.MeasureSince([]string{"nomad", "plan", "evaluate"}, time.Now())
 
 	// Create a result holder for the plan
@@ -176,43 +213,46 @@ func evaluatePlan(snap *state.StateSnapshot, plan *structs.Plan) (*structs.PlanR
 
 	// Collect all the nodeIDs
 	nodeIDs := make(map[string]struct{})
+	nodeIDList := make([]string, 0, len(plan.NodeUpdate)+len(plan.NodeAllocation))
 	for nodeID := range plan.NodeUpdate {
-		nodeIDs[nodeID] = struct{}{}
+		if _, ok := nodeIDs[nodeID]; !ok {
+			nodeIDs[nodeID] = struct{}{}
+			nodeIDList = append(nodeIDList, nodeID)
+		}
 	}
 	for nodeID := range plan.NodeAllocation {
-		nodeIDs[nodeID] = struct{}{}
+		if _, ok := nodeIDs[nodeID]; !ok {
+			nodeIDs[nodeID] = struct{}{}
+			nodeIDList = append(nodeIDList, nodeID)
+		}
 	}
 
-	// Check each allocation to see if it should be allowed
-	for nodeID := range nodeIDs {
+	// Setup a multierror to handle potentially getting many
+	// errors since we are processing in parallel.
+	var mErr multierror.Error
+	partialCommit := false
+
+	// handleResult is used to process the result of evaluateNodePlan
+	handleResult := func(nodeID string, fit bool, err error) (cancel bool) {
 		// Evaluate the plan for this node
-		fit, err := evaluateNodePlan(snap, plan, nodeID)
 		if err != nil {
-			return nil, err
+			mErr.Errors = append(mErr.Errors, err)
+			return true
 		}
 		if !fit {
-			// Scheduler must have stale data, RefreshIndex should force
-			// the latest view of allocations and nodes
-			allocIndex, err := snap.Index("allocs")
-			if err != nil {
-				return nil, err
-			}
-			nodeIndex, err := snap.Index("nodes")
-			if err != nil {
-				return nil, err
-			}
-			result.RefreshIndex = maxUint64(nodeIndex, allocIndex)
+			// Set that this is a partial commit
+			partialCommit = true
 
 			// If we require all-at-once scheduling, there is no point
 			// to continue the evaluation, as we've already failed.
 			if plan.AllAtOnce {
 				result.NodeUpdate = nil
 				result.NodeAllocation = nil
-				return result, nil
+				return true
 			}
 
 			// Skip this node, since it cannot be used.
-			continue
+			return
 		}
 
 		// Add this to the plan result
@@ -222,8 +262,66 @@ func evaluatePlan(snap *state.StateSnapshot, plan *structs.Plan) (*structs.PlanR
 		if nodeAlloc := plan.NodeAllocation[nodeID]; len(nodeAlloc) > 0 {
 			result.NodeAllocation[nodeID] = nodeAlloc
 		}
+		return
 	}
-	return result, nil
+
+	// Get the pool channels
+	req := pool.RequestCh()
+	resp := pool.ResultCh()
+	outstanding := 0
+	didCancel := false
+
+	// Evalute each node in the plan, handling results as they are ready to
+	// avoid blocking.
+	for len(nodeIDList) > 0 {
+		nodeID := nodeIDList[0]
+		select {
+		case req <- evaluateRequest{snap, plan, nodeID}:
+			outstanding++
+			nodeIDList = nodeIDList[1:]
+		case r := <-resp:
+			outstanding--
+
+			// Handle a result that allows us to cancel evaluation,
+			// which may save time processing additional entries.
+			if cancel := handleResult(r.nodeID, r.fit, r.err); cancel {
+				didCancel = true
+				break
+			}
+		}
+	}
+
+	// Drain the remaining results
+	for outstanding > 0 {
+		r := <-resp
+		if !didCancel {
+			if cancel := handleResult(r.nodeID, r.fit, r.err); cancel {
+				didCancel = true
+			}
+		}
+		outstanding--
+	}
+
+	// If the plan resulted in a partial commit, we need to determine
+	// a minimum refresh index to force the scheduler to work on a more
+	// up-to-date state to avoid the failures.
+	if partialCommit {
+		allocIndex, err := snap.Index("allocs")
+		if err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+		nodeIndex, err := snap.Index("nodes")
+		if err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+		result.RefreshIndex = maxUint64(nodeIndex, allocIndex)
+
+		if result.RefreshIndex == 0 {
+			err := fmt.Errorf("partialCommit with RefreshIndex of 0 (%d node, %d alloc)", nodeIndex, allocIndex)
+			mErr.Errors = append(mErr.Errors, err)
+		}
+	}
+	return result, mErr.ErrorOrNil()
 }
 
 // evaluateNodePlan is used to evalute the plan for a single node,
@@ -247,14 +345,11 @@ func evaluateNodePlan(snap *state.StateSnapshot, plan *structs.Plan, nodeID stri
 		return false, nil
 	}
 
-	// Get the existing allocations
-	existingAlloc, err := snap.AllocsByNode(nodeID)
+	// Get the existing allocations that are non-terminal
+	existingAlloc, err := snap.AllocsByNodeTerminal(nodeID, false)
 	if err != nil {
 		return false, fmt.Errorf("failed to get existing allocations for '%s': %v", nodeID, err)
 	}
-
-	// Filter on alloc state
-	existingAlloc = structs.FilterTerminalAllocs(existingAlloc)
 
 	// Determine the proposed allocation by first removing allocations
 	// that are planned evictions and adding the new allocations.

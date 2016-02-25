@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -15,12 +16,18 @@ var (
 	// The name of the directory that is shared across tasks in a task group.
 	SharedAllocName = "alloc"
 
+	// Name of the directory where logs of Tasks are written
+	LogDirName = "logs"
+
 	// The set of directories that exist inside eache shared alloc directory.
-	SharedAllocDirs = []string{"logs", "tmp", "data"}
+	SharedAllocDirs = []string{LogDirName, "tmp", "data"}
 
 	// The name of the directory that exists inside each task directory
 	// regardless of driver.
 	TaskLocal = "local"
+
+	// TaskDirs is the set of directories created in each tasks directory.
+	TaskDirs = []string{"tmp"}
 )
 
 type AllocDir struct {
@@ -34,9 +41,6 @@ type AllocDir struct {
 
 	// TaskDirs is a mapping of task names to their non-shared directory.
 	TaskDirs map[string]string
-
-	// A list of locations the shared alloc has been mounted to.
-	mounted []string
 }
 
 // AllocFileInfo holds information about a file inside the AllocDir
@@ -64,19 +68,45 @@ func NewAllocDir(allocDir string) *AllocDir {
 // Tears down previously build directory structure.
 func (d *AllocDir) Destroy() error {
 	// Unmount all mounted shared alloc dirs.
-	for _, m := range d.mounted {
-		if err := d.unmountSharedDir(m); err != nil {
-			return fmt.Errorf("Failed to unmount shared directory: %v", err)
-		}
+	var mErr multierror.Error
+	if err := d.UnmountAll(); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
 	}
 
-	return os.RemoveAll(d.AllocDir)
+	if err := os.RemoveAll(d.AllocDir); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	return mErr.ErrorOrNil()
+}
+
+func (d *AllocDir) UnmountAll() error {
+	var mErr multierror.Error
+	for _, dir := range d.TaskDirs {
+		// Check if the directory has the shared alloc mounted.
+		taskAlloc := filepath.Join(dir, SharedAllocName)
+		if d.pathExists(taskAlloc) {
+			if err := d.unmountSharedDir(taskAlloc); err != nil {
+				mErr.Errors = append(mErr.Errors,
+					fmt.Errorf("failed to unmount shared alloc dir %q: %v", taskAlloc, err))
+			}
+			if err := os.RemoveAll(taskAlloc); err != nil {
+				mErr.Errors = append(mErr.Errors,
+					fmt.Errorf("failed to delete shared alloc dir %q: %v", taskAlloc, err))
+			}
+		}
+
+		// Unmount dev/ and proc/ have been mounted.
+		d.unmountSpecialDirs(dir)
+	}
+
+	return mErr.ErrorOrNil()
 }
 
 // Given a list of a task build the correct alloc structure.
 func (d *AllocDir) Build(tasks []*structs.Task) error {
 	// Make the alloc directory, owned by the nomad process.
-	if err := os.MkdirAll(d.AllocDir, 0700); err != nil {
+	if err := os.MkdirAll(d.AllocDir, 0755); err != nil {
 		return fmt.Errorf("Failed to make the alloc directory %v: %v", d.AllocDir, err)
 	}
 
@@ -93,6 +123,9 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 	for _, dir := range SharedAllocDirs {
 		p := filepath.Join(d.SharedDir, dir)
 		if err := os.Mkdir(p, 0777); err != nil {
+			return err
+		}
+		if err := d.dropDirPermissions(p); err != nil {
 			return err
 		}
 	}
@@ -120,6 +153,18 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 		}
 
 		d.TaskDirs[t.Name] = taskDir
+
+		// Create the directories that should be in every task.
+		for _, dir := range TaskDirs {
+			local := filepath.Join(taskDir, dir)
+			if err := os.Mkdir(local, 0777); err != nil {
+				return err
+			}
+
+			if err := d.dropDirPermissions(local); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -233,8 +278,12 @@ func (d *AllocDir) MountSharedDir(task string) error {
 		return fmt.Errorf("Failed to mount shared directory for task %v: %v", task, err)
 	}
 
-	d.mounted = append(d.mounted, taskLoc)
 	return nil
+}
+
+// LogDir returns the log dir in the current allocation directory
+func (d *AllocDir) LogDir() string {
+	return filepath.Join(d.AllocDir, SharedAllocName, LogDirName)
 }
 
 // List returns the list of files at a path relative to the alloc dir
@@ -309,4 +358,14 @@ func fileCopy(src, dst string, perm os.FileMode) error {
 	}
 
 	return nil
+}
+
+// pathExists is a helper function to check if the path exists.
+func (d *AllocDir) pathExists(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
 }

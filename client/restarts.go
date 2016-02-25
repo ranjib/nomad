@@ -2,6 +2,7 @@ package client
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -10,9 +11,14 @@ import (
 // jitter is the percent of jitter added to restart delays.
 const jitter = 0.25
 
-func newRestartTracker(policy *structs.RestartPolicy) *RestartTracker {
+func newRestartTracker(policy *structs.RestartPolicy, jobType string) *RestartTracker {
+	onSuccess := true
+	if jobType == structs.JobTypeBatch {
+		onSuccess = false
+	}
 	return &RestartTracker{
 		startTime: time.Now(),
+		onSuccess: onSuccess,
 		policy:    policy,
 		rand:      rand.New(rand.NewSource(time.Now().Unix())),
 	}
@@ -20,12 +26,31 @@ func newRestartTracker(policy *structs.RestartPolicy) *RestartTracker {
 
 type RestartTracker struct {
 	count     int       // Current number of attempts.
+	onSuccess bool      // Whether to restart on successful exit code.
 	startTime time.Time // When the interval began
 	policy    *structs.RestartPolicy
 	rand      *rand.Rand
+	lock      sync.Mutex
 }
 
+// SetPolicy updates the policy used to determine restarts.
+func (r *RestartTracker) SetPolicy(policy *structs.RestartPolicy) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.policy = policy
+}
+
+// NextRestart takes the exit code from the last attempt and returns whether the
+// task should be restarted and the duration to wait.
 func (r *RestartTracker) NextRestart(exitCode int) (bool, time.Duration) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	// Hot path if no attempts are expected
+	if r.policy.Attempts == 0 {
+		return false, 0
+	}
+
 	// Check if we have entered a new interval.
 	end := r.startTime.Add(r.policy.Interval)
 	now := time.Now()
@@ -52,9 +77,9 @@ func (r *RestartTracker) NextRestart(exitCode int) (bool, time.Duration) {
 }
 
 // shouldRestart returns whether a restart should occur based on the exit code
-// and the RestartOnSuccess configuration.
+// and job type.
 func (r *RestartTracker) shouldRestart(exitCode int) bool {
-	return exitCode != 0 || r.policy.RestartOnSuccess
+	return exitCode != 0 || r.onSuccess
 }
 
 // jitter returns the delay time plus a jitter.
@@ -72,5 +97,5 @@ func (r *RestartTracker) jitter() time.Duration {
 // Returns a tracker that never restarts.
 func noRestartsTracker() *RestartTracker {
 	policy := &structs.RestartPolicy{Attempts: 0, Mode: structs.RestartPolicyModeFail}
-	return newRestartTracker(policy)
+	return newRestartTracker(policy, structs.JobTypeBatch)
 }

@@ -34,7 +34,7 @@ func (n *Node) ComputeClass() error {
 		return err
 	}
 
-	n.ComputedClass = hash
+	n.ComputedClass = fmt.Sprintf("v1:%d", hash)
 	return nil
 }
 
@@ -82,11 +82,11 @@ func EscapedConstraints(constraints []*Constraint) []*Constraint {
 // computed node class optimization.
 func constraintTargetEscapes(target string) bool {
 	switch {
-	case strings.HasPrefix(target, "$node.unique."):
+	case strings.HasPrefix(target, "${node.unique."):
 		return true
-	case strings.HasPrefix(target, "$attr.unique."):
+	case strings.HasPrefix(target, "${attr.unique."):
 		return true
-	case strings.HasPrefix(target, "$meta.unique."):
+	case strings.HasPrefix(target, "${meta.unique."):
 		return true
 	default:
 		return false

@@ -92,8 +92,14 @@ func NewDriverContext(taskName string, config *config.Config, node *structs.Node
 func (d *DriverContext) KillTimeout(task *structs.Task) time.Duration {
 	max := d.config.MaxKillTimeout.Nanoseconds()
 	desired := task.KillTimeout.Nanoseconds()
+
+	// Make the minimum time between signal and kill, 1 second.
+	if desired == 0 {
+		desired = (1 * time.Second).Nanoseconds()
+	}
+
 	if desired < max {
-		return task.KillTimeout
+		return time.Duration(desired)
 	}
 
 	return d.config.MaxKillTimeout
@@ -108,7 +114,8 @@ type DriverHandle interface {
 	// WaitCh is used to return a channel used wait for task completion
 	WaitCh() chan *cstructs.WaitResult
 
-	// Update is used to update the task if possible
+	// Update is used to update the task if possible and update task related
+	// configurations.
 	Update(task *structs.Task) error
 
 	// Kill is used to stop the task
@@ -151,12 +158,7 @@ func GetTaskEnv(alloc *allocdir.AllocDir, node *structs.Node, task *structs.Task
 	if task.Resources != nil {
 		env.SetMemLimit(task.Resources.MemoryMB)
 		env.SetCpuLimit(task.Resources.CPU)
-
-		if len(task.Resources.Networks) > 0 {
-			network := task.Resources.Networks[0]
-			env.SetTaskIp(network.IP)
-			env.SetPorts(network.MapLabelToValues(nil))
-		}
+		env.SetNetworks(task.Resources.Networks)
 	}
 
 	return env.Build(), nil

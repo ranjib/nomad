@@ -7,11 +7,10 @@ services:
 language: go
 
 go:
-  - 1.5.3
-  - tip
+  - 1.6
 
 env:
-  - TRAVIS_RUN=true
+  - DOCKER_VERSION=1.9.1
 
 matrix:
   allow_failures:
@@ -22,6 +21,7 @@ branches:
     - master
 
 install:
+  - make prepare_docker
   - make bootstrap
 
 script:

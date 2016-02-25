@@ -35,13 +35,16 @@ job "binstore-storagelocker" {
             attempts = 5
             interval = "10m"
             delay = "15s"
-            on_success = true
             mode = "delay"
         }
         task "binstore" {
             driver = "docker"
             config {
                 image = "hashicorp/binstore"
+            }
+            logs {
+                max_files = 10
+                max_file_size = 100
             }
             env {
               HELLO = "world"
@@ -89,6 +92,7 @@ job "binstore-storagelocker" {
             resources {
                 cpu = 500
                 memory = 128
+                IOPS = 30
             }
             constraint {
                 attribute = "kernel.arch"

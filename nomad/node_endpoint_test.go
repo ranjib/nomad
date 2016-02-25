@@ -1,6 +1,7 @@
 package nomad
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestClientEndpoint_Register(t *testing.T) {
 	if out.CreateIndex != resp.Index {
 		t.Fatalf("index mis-match")
 	}
-	if out.ComputedClass == 0 {
+	if out.ComputedClass == "" {
 		t.Fatal("ComputedClass not set")
 	}
 }
@@ -357,7 +358,7 @@ func TestClientEndpoint_GetNode(t *testing.T) {
 		t.Fatalf("Bad index: %d %d", resp2.Index, resp.Index)
 	}
 
-	if resp2.Node.ComputedClass == 0 {
+	if resp2.Node.ComputedClass == "" {
 		t.Fatalf("bad ComputedClass: %#v", resp2.Node)
 	}
 
@@ -539,6 +540,156 @@ func TestClientEndpoint_GetAllocs(t *testing.T) {
 	}
 }
 
+func TestClientEndpoint_GetClientAllocs(t *testing.T) {
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	node.CreateIndex = resp.Index
+	node.ModifyIndex = resp.Index
+
+	// Inject fake evaluations
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	state := s1.fsm.State()
+	err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Lookup the allocs
+	get := &structs.NodeSpecificRequest{
+		NodeID:       node.ID,
+		QueryOptions: structs.QueryOptions{Region: "global"},
+	}
+	var resp2 structs.NodeClientAllocsResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", get, &resp2); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp2.Index != 100 {
+		t.Fatalf("Bad index: %d %d", resp2.Index, 100)
+	}
+
+	if len(resp2.Allocs) != 1 || resp2.Allocs[alloc.ID] != 100 {
+		t.Fatalf("bad: %#v", resp2.Allocs)
+	}
+
+	// Lookup non-existing node
+	get.NodeID = "foobarbaz"
+	var resp3 structs.NodeClientAllocsResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", get, &resp3); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp3.Index != 100 {
+		t.Fatalf("Bad index: %d %d", resp3.Index, 100)
+	}
+	if len(resp3.Allocs) != 0 {
+		t.Fatalf("unexpected node %#v", resp3.Allocs)
+	}
+}
+
+func TestClientEndpoint_GetClientAllocs_Blocking(t *testing.T) {
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	node.CreateIndex = resp.Index
+	node.ModifyIndex = resp.Index
+
+	// Inject fake evaluations async
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	state := s1.fsm.State()
+	start := time.Now()
+	time.AfterFunc(100*time.Millisecond, func() {
+		err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	})
+
+	// Lookup the allocs in a blocking query
+	req := &structs.NodeSpecificRequest{
+		NodeID: node.ID,
+		QueryOptions: structs.QueryOptions{
+			Region:        "global",
+			MinQueryIndex: 50,
+			MaxQueryTime:  time.Second,
+		},
+	}
+	var resp2 structs.NodeClientAllocsResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", req, &resp2); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Should block at least 100ms
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatalf("too fast")
+	}
+
+	if resp2.Index != 100 {
+		t.Fatalf("Bad index: %d %d", resp2.Index, 100)
+	}
+
+	if len(resp2.Allocs) != 1 || resp2.Allocs[alloc.ID] != 100 {
+		t.Fatalf("bad: %#v", resp2.Allocs)
+	}
+
+	// Alloc updates fire watches
+	time.AfterFunc(100*time.Millisecond, func() {
+		allocUpdate := mock.Alloc()
+		allocUpdate.NodeID = alloc.NodeID
+		allocUpdate.ID = alloc.ID
+		allocUpdate.ClientStatus = structs.AllocClientStatusRunning
+		err := state.UpsertAllocs(200, []*structs.Allocation{allocUpdate})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	})
+
+	req.QueryOptions.MinQueryIndex = 150
+	var resp3 structs.NodeClientAllocsResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.GetClientAllocs", req, &resp3); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if time.Since(start) < 100*time.Millisecond {
+		t.Fatalf("too fast")
+	}
+	if resp3.Index != 200 {
+		t.Fatalf("Bad index: %d %d", resp3.Index, 200)
+	}
+	if len(resp3.Allocs) != 1 || resp3.Allocs[alloc.ID] != 200 {
+		t.Fatalf("bad: %#v", resp3.Allocs)
+	}
+}
+
 func TestClientEndpoint_GetAllocs_Blocking(t *testing.T) {
 	s1 := testServer(t, nil)
 	defer s1.Shutdown()
@@ -605,7 +756,7 @@ func TestClientEndpoint_GetAllocs_Blocking(t *testing.T) {
 		allocUpdate.NodeID = alloc.NodeID
 		allocUpdate.ID = alloc.ID
 		allocUpdate.ClientStatus = structs.AllocClientStatusRunning
-		err := state.UpdateAllocFromClient(200, allocUpdate)
+		err := state.UpdateAllocsFromClient(200, []*structs.Allocation{allocUpdate})
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -667,11 +818,69 @@ func TestClientEndpoint_UpdateAlloc(t *testing.T) {
 		WriteRequest: structs.WriteRequest{Region: "global"},
 	}
 	var resp2 structs.NodeAllocsResponse
+	start := time.Now()
 	if err := msgpackrpc.CallWithCodec(codec, "Node.UpdateAlloc", update, &resp2); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if resp2.Index == 0 {
 		t.Fatalf("Bad index: %d", resp2.Index)
+	}
+	if diff := time.Since(start); diff < batchUpdateInterval {
+		t.Fatalf("too fast: %v", diff)
+	}
+
+	// Lookup the alloc
+	out, err := state.AllocByID(alloc.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out.ClientStatus != structs.AllocClientStatusFailed {
+		t.Fatalf("Bad: %#v", out)
+	}
+}
+
+func TestClientEndpoint_BatchUpdate(t *testing.T) {
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the register request
+	node := mock.Node()
+	reg := &structs.NodeRegisterRequest{
+		Node:         node,
+		WriteRequest: structs.WriteRequest{Region: "global"},
+	}
+
+	// Fetch the response
+	var resp structs.GenericResponse
+	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", reg, &resp); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Inject fake evaluations
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	state := s1.fsm.State()
+	err := state.UpsertAllocs(100, []*structs.Allocation{alloc})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Attempt update
+	clientAlloc := new(structs.Allocation)
+	*clientAlloc = *alloc
+	clientAlloc.ClientStatus = structs.AllocClientStatusFailed
+
+	// Call to do the batch update
+	bf := NewBatchFuture()
+	endpoint := s1.endpoints.Node
+	endpoint.batchUpdate(bf, []*structs.Allocation{clientAlloc})
+	if err := bf.Wait(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if bf.Index() == 0 {
+		t.Fatalf("Bad index: %d", bf.Index())
 	}
 
 	// Lookup the alloc
@@ -1016,5 +1225,32 @@ func TestClientEndpoint_ListNodes_Blocking(t *testing.T) {
 	}
 	if len(resp4.Nodes) != 0 {
 		t.Fatalf("bad: %#v", resp4.Nodes)
+	}
+}
+
+func TestBatchFuture(t *testing.T) {
+	bf := NewBatchFuture()
+
+	// Async respond to the future
+	expect := fmt.Errorf("testing")
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		bf.Respond(1000, expect)
+	}()
+
+	// Block for the result
+	start := time.Now()
+	err := bf.Wait()
+	diff := time.Since(start)
+	if diff < 5*time.Millisecond {
+		t.Fatalf("too fast")
+	}
+
+	// Check the results
+	if err != expect {
+		t.Fatalf("bad: %s", err)
+	}
+	if bf.Index() != 1000 {
+		t.Fatalf("bad: %d", bf.Index())
 	}
 }

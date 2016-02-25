@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/hashstructure"
 )
 
 const (
@@ -52,6 +54,18 @@ const (
 	// starting and the intial heartbeat. After the intial heartbeat,
 	// we switch to using the TTL specified by the servers.
 	initialHeartbeatStagger = 10 * time.Second
+
+	// nodeUpdateRetryIntv is how often the client checks for updates to the
+	// node attributes or meta map.
+	nodeUpdateRetryIntv = 5 * time.Second
+
+	// allocSyncIntv is the batching period of allocation updates before they
+	// are synced with the server.
+	allocSyncIntv = 200 * time.Millisecond
+
+	// allocSyncRetryIntv is the interval on which we retry updating
+	// the status of the allocation
+	allocSyncRetryIntv = 5 * time.Second
 )
 
 // DefaultConfig returns the default configuration
@@ -69,6 +83,10 @@ type Client struct {
 	config *config.Config
 	start  time.Time
 
+	// configCopy is a copy that should be passed to alloc-runners.
+	configCopy *config.Config
+	configLock sync.RWMutex
+
 	logger *log.Logger
 
 	consulService *ConsulService
@@ -84,10 +102,14 @@ type Client struct {
 
 	lastHeartbeat time.Time
 	heartbeatTTL  time.Duration
+	heartbeatLock sync.Mutex
 
 	// allocs is the current set of allocations
 	allocs    map[string]*AllocRunner
 	allocLock sync.RWMutex
+
+	// allocUpdates stores allocations that need to be synced to the server.
+	allocUpdates chan *structs.Allocation
 
 	shutdown     bool
 	shutdownCh   chan struct{}
@@ -101,12 +123,13 @@ func NewClient(cfg *config.Config) (*Client, error) {
 
 	// Create the client
 	c := &Client{
-		config:     cfg,
-		start:      time.Now(),
-		connPool:   nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
-		logger:     logger,
-		allocs:     make(map[string]*AllocRunner),
-		shutdownCh: make(chan struct{}),
+		config:       cfg,
+		start:        time.Now(),
+		connPool:     nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
+		logger:       logger,
+		allocs:       make(map[string]*AllocRunner),
+		allocUpdates: make(chan *structs.Allocation, 64),
+		shutdownCh:   make(chan struct{}),
 	}
 
 	// Setup the Consul Service
@@ -137,16 +160,30 @@ func NewClient(cfg *config.Config) (*Client, error) {
 	// Set up the known servers list
 	c.SetServers(c.config.Servers)
 
+	// Store the config copy before restoring state but after it has been
+	// initialized.
+	c.configCopy = c.config.Copy()
+
+	// Start the consul service
+	go c.consulService.SyncWithConsul()
+
 	// Restore the state
 	if err := c.restoreState(); err != nil {
 		return nil, fmt.Errorf("failed to restore state: %v", err)
 	}
 
+	// Register and then start heartbeating to the servers.
+	go c.registerAndHeartbeat()
+
+	// Begin periodic snapshotting of state.
+	go c.periodicSnapshot()
+
+	// Begin syncing allocations to the server
+	go c.allocSync()
+
 	// Start the client!
 	go c.run()
 
-	// Start the consul service
-	go c.consulService.SyncWithConsul()
 	return c, nil
 }
 
@@ -195,7 +232,7 @@ func (c *Client) init() error {
 
 	// Ensure the alloc dir exists if we have one
 	if c.config.AllocDir != "" {
-		if err := os.MkdirAll(c.config.AllocDir, 0700); err != nil {
+		if err := os.MkdirAll(c.config.AllocDir, 0755); err != nil {
 			return fmt.Errorf("failed creating alloc dir: %s", err)
 		}
 	} else {
@@ -324,7 +361,26 @@ func (c *Client) SetServers(servers []string) {
 	if servers == nil {
 		servers = make([]string, 0)
 	}
-	c.servers = servers
+	// net.ResolveTCPAddr requires port to be set, if one is not provided, supply default port
+	// Using net.SplitHostPort in the event of IPv6 addresses with multiple colons.
+	// IPv6 addresses must be passed in with brackets,
+	// i.e: [::1]:4647 or [::1]
+	setServers := make([]string, len(servers))
+	copy(setServers, servers)
+	for i := 0; i < len(setServers); i++ {
+		if _, _, err := net.SplitHostPort(setServers[i]); err != nil {
+			// multiple errors can be returned here, only searching for missing
+			if strings.Contains(err.Error(), "missing port") {
+				c.logger.Printf("[WARN] client: port not specified, using default port")
+				setServers[i] = net.JoinHostPort(setServers[i], "4647")
+			} else {
+				c.logger.Printf("[WARN] client: server address %q invalid: %v", setServers[i], err)
+			}
+		}
+	}
+
+	c.logger.Printf("[INFO] client: setting server address list: %s", setServers)
+	c.servers = setServers
 }
 
 // Stats is used to return statistics for debugging and insight
@@ -352,6 +408,8 @@ func (c *Client) Stats() map[string]map[string]string {
 
 // Node returns the locally registered node
 func (c *Client) Node() *structs.Node {
+	c.configLock.RLock()
+	defer c.configLock.RUnlock()
 	return c.config.Node
 }
 
@@ -383,7 +441,9 @@ func (c *Client) restoreState() error {
 	for _, entry := range list {
 		id := entry.Name()
 		alloc := &structs.Allocation{ID: id}
-		ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulService)
+		c.configLock.RLock()
+		ar := NewAllocRunner(c.logger, c.configCopy, c.updateAllocStatus, alloc, c.consulService)
+		c.configLock.RUnlock()
 		c.allocs[id] = ar
 		if err := ar.RestoreState(); err != nil {
 			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v", id, err)
@@ -402,9 +462,7 @@ func (c *Client) saveState() error {
 	}
 
 	var mErr multierror.Error
-	c.allocLock.RLock()
-	defer c.allocLock.RUnlock()
-	for id, ar := range c.allocs {
+	for id, ar := range c.getAllocRunners() {
 		if err := ar.SaveState(); err != nil {
 			c.logger.Printf("[ERR] client: failed to save state for alloc %s: %v",
 				id, err)
@@ -412,6 +470,17 @@ func (c *Client) saveState() error {
 		}
 	}
 	return mErr.ErrorOrNil()
+}
+
+// getAllocRunners returns a snapshot of the current set of alloc runners.
+func (c *Client) getAllocRunners() map[string]*AllocRunner {
+	c.allocLock.RLock()
+	defer c.allocLock.RUnlock()
+	runners := make(map[string]*AllocRunner, len(c.allocs))
+	for id, ar := range c.allocs {
+		runners[id] = ar
+	}
+	return runners
 }
 
 // nodeID restores a persistent unique ID or generates a new one
@@ -498,7 +567,10 @@ func (c *Client) fingerprint() error {
 		if err != nil {
 			return err
 		}
+
+		c.configLock.Lock()
 		applies, err := f.Fingerprint(c.config, c.config.Node)
+		c.configLock.Unlock()
 		if err != nil {
 			return err
 		}
@@ -526,9 +598,11 @@ func (c *Client) fingerprintPeriodic(name string, f fingerprint.Fingerprint, d t
 	for {
 		select {
 		case <-time.After(d):
+			c.configLock.Lock()
 			if _, err := f.Fingerprint(c.config, c.config.Node); err != nil {
 				c.logger.Printf("[DEBUG] client: periodic fingerprinting for %v failed: %v", name, err)
 			}
+			c.configLock.Unlock()
 		case <-c.shutdownCh:
 			return
 		}
@@ -556,7 +630,9 @@ func (c *Client) setupDrivers() error {
 		if err != nil {
 			return err
 		}
+		c.configLock.Lock()
 		applies, err := d.Fingerprint(c.config, c.config.Node)
+		c.configLock.Unlock()
 		if err != nil {
 			return err
 		}
@@ -582,19 +658,11 @@ func (c *Client) retryIntv(base time.Duration) time.Duration {
 	return base + randomStagger(base)
 }
 
-// run is a long lived goroutine used to run the client
-func (c *Client) run() {
-	// Register the client
-	for {
-		if err := c.registerNode(); err == nil {
-			break
-		}
-		select {
-		case <-time.After(c.retryIntv(registerRetryIntv)):
-		case <-c.shutdownCh:
-			return
-		}
-	}
+// registerAndHeartbeat is a long lived goroutine used to register the client
+// and then start heartbeatng to the server.
+func (c *Client) registerAndHeartbeat() {
+	// Register the node
+	c.retryRegisterNode()
 
 	// Setup the heartbeat timer, for the initial registration
 	// we want to do this quickly. We want to do it extra quickly
@@ -606,14 +674,29 @@ func (c *Client) run() {
 		heartbeat = time.After(randomStagger(initialHeartbeatStagger))
 	}
 
-	// Watch for changes in allocations
-	allocUpdates := make(chan []*structs.Allocation, 1)
-	go c.watchAllocations(allocUpdates)
+	for {
+		select {
+		case <-heartbeat:
+			if err := c.updateNodeStatus(); err != nil {
+				heartbeat = time.After(c.retryIntv(registerRetryIntv))
+			} else {
+				c.heartbeatLock.Lock()
+				heartbeat = time.After(c.heartbeatTTL)
+				c.heartbeatLock.Unlock()
+			}
 
+		case <-c.shutdownCh:
+			return
+		}
+	}
+}
+
+// periodicSnapshot is a long lived goroutine used to periodically snapshot the
+// state of the client
+func (c *Client) periodicSnapshot() {
 	// Create a snapshot timer
 	snapshot := time.After(stateSnapshotIntv)
 
-	// Periodically update our status and wait for termination
 	for {
 		select {
 		case <-snapshot:
@@ -622,16 +705,64 @@ func (c *Client) run() {
 				c.logger.Printf("[ERR] client: failed to save state: %v", err)
 			}
 
-		case allocs := <-allocUpdates:
-			c.runAllocs(allocs)
+		case <-c.shutdownCh:
+			return
+		}
+	}
+}
 
-		case <-heartbeat:
-			if err := c.updateNodeStatus(); err != nil {
-				heartbeat = time.After(c.retryIntv(registerRetryIntv))
-			} else {
-				heartbeat = time.After(c.heartbeatTTL)
-			}
+// run is a long lived goroutine used to run the client
+func (c *Client) run() {
+	// Watch for node changes
+	go c.watchNodeUpdates()
 
+	// Watch for changes in allocations
+	allocUpdates := make(chan *allocUpdates, 8)
+	go c.watchAllocations(allocUpdates)
+
+	for {
+		select {
+		case update := <-allocUpdates:
+			c.runAllocs(update)
+
+		case <-c.shutdownCh:
+			return
+		}
+	}
+}
+
+// hasNodeChanged calculates a hash for the node attributes- and meta map.
+// The new hash values are compared against the old (passed-in) hash values to
+// determine if the node properties have changed. It returns the new hash values
+// in case they are different from the old hash values.
+func (c *Client) hasNodeChanged(oldAttrHash uint64, oldMetaHash uint64) (bool, uint64, uint64) {
+	c.configLock.RLock()
+	defer c.configLock.RUnlock()
+	newAttrHash, err := hashstructure.Hash(c.config.Node.Attributes, nil)
+	if err != nil {
+		c.logger.Printf("[DEBUG] client: unable to calculate node attributes hash: %v", err)
+	}
+	// Calculate node meta map hash
+	newMetaHash, err := hashstructure.Hash(c.config.Node.Meta, nil)
+	if err != nil {
+		c.logger.Printf("[DEBUG] client: unable to calculate node meta hash: %v", err)
+	}
+	if newAttrHash != oldAttrHash || newMetaHash != oldMetaHash {
+		return true, newAttrHash, newMetaHash
+	}
+	return false, oldAttrHash, oldMetaHash
+}
+
+// retryRegisterNode is used to register the node or update the registration and
+// retry in case of failure.
+func (c *Client) retryRegisterNode() {
+	// Register the client
+	for {
+		if err := c.registerNode(); err == nil {
+			break
+		}
+		select {
+		case <-time.After(c.retryIntv(registerRetryIntv)):
 		case <-c.shutdownCh:
 			return
 		}
@@ -653,10 +784,19 @@ func (c *Client) registerNode() error {
 		}
 		return err
 	}
+
+	// Update the node status to ready after we register.
+	c.configLock.Lock()
+	node.Status = structs.NodeStatusReady
+	c.configLock.Unlock()
+
 	c.logger.Printf("[DEBUG] client: node registration complete")
 	if len(resp.EvalIDs) != 0 {
 		c.logger.Printf("[DEBUG] client: %d evaluations triggered by node registration", len(resp.EvalIDs))
 	}
+
+	c.heartbeatLock.Lock()
+	defer c.heartbeatLock.Unlock()
 	c.lastHeartbeat = time.Now()
 	c.heartbeatTTL = resp.HeartbeatTTL
 	return nil
@@ -682,28 +822,94 @@ func (c *Client) updateNodeStatus() error {
 	if resp.Index != 0 {
 		c.logger.Printf("[DEBUG] client: state updated to %s", req.Status)
 	}
+
+	c.heartbeatLock.Lock()
+	defer c.heartbeatLock.Unlock()
 	c.lastHeartbeat = time.Now()
 	c.heartbeatTTL = resp.HeartbeatTTL
 	return nil
 }
 
 // updateAllocStatus is used to update the status of an allocation
-func (c *Client) updateAllocStatus(alloc *structs.Allocation) error {
-	args := structs.AllocUpdateRequest{
-		Alloc:        []*structs.Allocation{alloc},
-		WriteRequest: structs.WriteRequest{Region: c.config.Region},
+func (c *Client) updateAllocStatus(alloc *structs.Allocation) {
+	// Only send the fields that are updatable by the client.
+	stripped := new(structs.Allocation)
+	stripped.ID = alloc.ID
+	stripped.NodeID = c.Node().ID
+	stripped.TaskStates = alloc.TaskStates
+	stripped.ClientStatus = alloc.ClientStatus
+	stripped.ClientDescription = alloc.ClientDescription
+	select {
+	case c.allocUpdates <- stripped:
+	case <-c.shutdownCh:
 	}
-	var resp structs.GenericResponse
-	err := c.RPC("Node.UpdateAlloc", &args, &resp)
-	if err != nil {
-		c.logger.Printf("[ERR] client: failed to update allocation: %v", err)
-		return err
+}
+
+// allocSync is a long lived function that batches allocation updates to the
+// server.
+func (c *Client) allocSync() {
+	staggered := false
+	syncTicker := time.NewTicker(allocSyncIntv)
+	updates := make(map[string]*structs.Allocation)
+	for {
+		select {
+		case <-c.shutdownCh:
+			syncTicker.Stop()
+			return
+		case alloc := <-c.allocUpdates:
+			// Batch the allocation updates until the timer triggers.
+			updates[alloc.ID] = alloc
+		case <-syncTicker.C:
+			// Fast path if there are no updates
+			if len(updates) == 0 {
+				continue
+			}
+
+			sync := make([]*structs.Allocation, 0, len(updates))
+			for _, alloc := range updates {
+				sync = append(sync, alloc)
+			}
+
+			// Send to server.
+			args := structs.AllocUpdateRequest{
+				Alloc:        sync,
+				WriteRequest: structs.WriteRequest{Region: c.config.Region},
+			}
+
+			var resp structs.GenericResponse
+			if err := c.RPC("Node.UpdateAlloc", &args, &resp); err != nil {
+				c.logger.Printf("[ERR] client: failed to update allocations: %v", err)
+				syncTicker.Stop()
+				syncTicker = time.NewTicker(c.retryIntv(allocSyncRetryIntv))
+				staggered = true
+			} else {
+				updates = make(map[string]*structs.Allocation)
+				if staggered {
+					syncTicker.Stop()
+					syncTicker = time.NewTicker(allocSyncIntv)
+					staggered = false
+				}
+			}
+		}
 	}
-	return nil
+}
+
+// allocUpdates holds the results of receiving updated allocations from the
+// servers.
+type allocUpdates struct {
+	// pulled is the set of allocations that were downloaded from the servers.
+	pulled map[string]*structs.Allocation
+
+	// filtered is the set of allocations that were not pulled because their
+	// AllocModifyIndex didn't change.
+	filtered map[string]struct{}
 }
 
 // watchAllocations is used to scan for updates to allocations
-func (c *Client) watchAllocations(allocUpdates chan []*structs.Allocation) {
+func (c *Client) watchAllocations(updates chan *allocUpdates) {
+	// The request and response for getting the map of allocations that should
+	// be running on the Node to their AllocModifyIndex which is incremented
+	// when the allocation is updated by the servers.
 	req := structs.NodeSpecificRequest{
 		NodeID: c.Node().ID,
 		QueryOptions: structs.QueryOptions{
@@ -711,12 +917,24 @@ func (c *Client) watchAllocations(allocUpdates chan []*structs.Allocation) {
 			AllowStale: true,
 		},
 	}
-	var resp structs.NodeAllocsResponse
+	var resp structs.NodeClientAllocsResponse
+
+	// The request and response for pulling down the set of allocations that are
+	// new, or updated server side.
+	allocsReq := structs.AllocsGetRequest{
+		QueryOptions: structs.QueryOptions{
+			Region:     c.config.Region,
+			AllowStale: true,
+		},
+	}
+	var allocsResp structs.AllocsGetResponse
 
 	for {
-		// Get the allocations, blocking for updates
-		resp = structs.NodeAllocsResponse{}
-		err := c.RPC("Node.GetAllocs", &req, &resp)
+		// Get the allocation modify index map, blocking for updates. We will
+		// use this to determine exactly what allocations need to be downloaded
+		// in full.
+		resp = structs.NodeClientAllocsResponse{}
+		err := c.RPC("Node.GetClientAllocs", &req, &resp)
 		if err != nil {
 			c.logger.Printf("[ERR] client: failed to query for node allocations: %v", err)
 			retry := c.retryIntv(getAllocRetryIntv)
@@ -735,16 +953,96 @@ func (c *Client) watchAllocations(allocUpdates chan []*structs.Allocation) {
 		default:
 		}
 
-		// Check for updates
+		// Filter all allocations whose AllocModifyIndex was not incremented.
+		// These are the allocations who have either not been updated, or whose
+		// updates are a result of the client sending an update for the alloc.
+		// This lets us reduce the network traffic to the server as we don't
+		// need to pull all the allocations.
+		var pull []string
+		filtered := make(map[string]struct{})
+		runners := c.getAllocRunners()
+		for allocID, modifyIndex := range resp.Allocs {
+			// Pull the allocation if we don't have an alloc runner for the
+			// allocation or if the alloc runner requires an updated allocation.
+			runner, ok := runners[allocID]
+			if !ok || runner.shouldUpdate(modifyIndex) {
+				pull = append(pull, allocID)
+			} else {
+				filtered[allocID] = struct{}{}
+			}
+		}
+
+		c.logger.Printf("[DEBUG] client: updated allocations at index %d (pulled %d) (filtered %d)",
+			resp.Index, len(pull), len(filtered))
+
+		// Pull the allocations that passed filtering.
+		allocsResp.Allocs = nil
+		if len(pull) != 0 {
+			// Pull the allocations that need to be updated.
+			allocsReq.AllocIDs = pull
+			allocsResp = structs.AllocsGetResponse{}
+			if err := c.RPC("Alloc.GetAllocs", &allocsReq, &allocsResp); err != nil {
+				c.logger.Printf("[ERR] client: failed to query updated allocations: %v", err)
+				retry := c.retryIntv(getAllocRetryIntv)
+				select {
+				case <-time.After(retry):
+					continue
+				case <-c.shutdownCh:
+					return
+				}
+			}
+
+			// Check for shutdown
+			select {
+			case <-c.shutdownCh:
+				return
+			default:
+			}
+		}
+
+		// Update the query index.
 		if resp.Index <= req.MinQueryIndex {
 			continue
 		}
 		req.MinQueryIndex = resp.Index
-		c.logger.Printf("[DEBUG] client: updated allocations at index %d (%d allocs)", resp.Index, len(resp.Allocs))
 
-		// Push the updates
+		// Push the updates.
+		pulled := make(map[string]*structs.Allocation, len(allocsResp.Allocs))
+		for _, alloc := range allocsResp.Allocs {
+			pulled[alloc.ID] = alloc
+		}
+		update := &allocUpdates{
+			filtered: filtered,
+			pulled:   pulled,
+		}
 		select {
-		case allocUpdates <- resp.Allocs:
+		case updates <- update:
+		case <-c.shutdownCh:
+			return
+		}
+	}
+}
+
+// watchNodeUpdates periodically checks for changes to the node attributes or meta map
+func (c *Client) watchNodeUpdates() {
+	c.logger.Printf("[DEBUG] client: periodically checking for node changes at duration %v", nodeUpdateRetryIntv)
+	var attrHash, metaHash uint64
+	var changed bool
+	for {
+		select {
+		case <-time.After(nodeUpdateRetryIntv):
+			changed, attrHash, metaHash = c.hasNodeChanged(attrHash, metaHash)
+			if changed {
+				c.logger.Printf("[DEBUG] client: state changed, updating node.")
+
+				// Update the config copy.
+				c.configLock.Lock()
+				node := c.config.Node.Copy()
+				c.configCopy.Node = node
+				c.configLock.Unlock()
+
+				c.retryRegisterNode()
+			}
 		case <-c.shutdownCh:
 			return
 		}
@@ -752,17 +1050,17 @@ func (c *Client) watchAllocations(allocUpdates chan []*structs.Allocation) {
 }
 
 // runAllocs is invoked when we get an updated set of allocations
-func (c *Client) runAllocs(updated []*structs.Allocation) {
+func (c *Client) runAllocs(update *allocUpdates) {
 	// Get the existing allocs
 	c.allocLock.RLock()
 	exist := make([]*structs.Allocation, 0, len(c.allocs))
 	for _, ar := range c.allocs {
-		exist = append(exist, ar.Alloc())
+		exist = append(exist, ar.alloc)
 	}
 	c.allocLock.RUnlock()
 
 	// Diff the existing and updated allocations
-	diff := diffAllocs(exist, updated)
+	diff := diffAllocs(exist, update)
 	c.logger.Printf("[DEBUG] client: %#v", diff)
 
 	// Remove the old allocations
@@ -798,36 +1096,43 @@ func (c *Client) runAllocs(updated []*structs.Allocation) {
 // removeAlloc is invoked when we should remove an allocation
 func (c *Client) removeAlloc(alloc *structs.Allocation) error {
 	c.allocLock.Lock()
-	defer c.allocLock.Unlock()
 	ar, ok := c.allocs[alloc.ID]
 	if !ok {
+		c.allocLock.Unlock()
 		c.logger.Printf("[WARN] client: missing context for alloc '%s'", alloc.ID)
 		return nil
 	}
-	ar.Destroy()
 	delete(c.allocs, alloc.ID)
+	c.allocLock.Unlock()
+
+	ar.Destroy()
 	return nil
 }
 
 // updateAlloc is invoked when we should update an allocation
 func (c *Client) updateAlloc(exist, update *structs.Allocation) error {
 	c.allocLock.RLock()
-	defer c.allocLock.RUnlock()
 	ar, ok := c.allocs[exist.ID]
+	c.allocLock.RUnlock()
 	if !ok {
 		c.logger.Printf("[WARN] client: missing context for alloc '%s'", exist.ID)
 		return nil
 	}
+
 	ar.Update(update)
 	return nil
 }
 
 // addAlloc is invoked when we should add an allocation
 func (c *Client) addAlloc(alloc *structs.Allocation) error {
-	c.allocLock.Lock()
-	defer c.allocLock.Unlock()
-	ar := NewAllocRunner(c.logger, c.config, c.updateAllocStatus, alloc, c.consulService)
-	c.allocs[alloc.ID] = ar
+	c.configLock.RLock()
+	ar := NewAllocRunner(c.logger, c.configCopy, c.updateAllocStatus, alloc, c.consulService)
+	c.configLock.RUnlock()
 	go ar.Run()
+
+	// Store the alloc runner.
+	c.allocLock.Lock()
+	c.allocs[alloc.ID] = ar
+	c.allocLock.Unlock()
 	return nil
 }

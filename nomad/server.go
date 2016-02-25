@@ -109,6 +109,10 @@ type Server struct {
 	// that are waiting to be brokered to a sub-scheduler
 	evalBroker *EvalBroker
 
+	// BlockedEvals is used to manage evaluations that are blocked on node
+	// capacity changes.
+	blockedEvals *BlockedEvals
+
 	// planQueue is used to manage the submitted allocation
 	// plans that are waiting to be assessed by the leader
 	planQueue *PlanQueue
@@ -140,6 +144,7 @@ type endpoints struct {
 	Alloc    *Alloc
 	Region   *Region
 	Periodic *Periodic
+	System   *System
 }
 
 // NewServer is used to construct a new Nomad server from the
@@ -164,6 +169,9 @@ func NewServer(config *Config) (*Server, error) {
 		return nil, err
 	}
 
+	// Create a new blocked eval tracker.
+	blockedEvals := NewBlockedEvals(evalBroker)
+
 	// Create a plan queue
 	planQueue, err := NewPlanQueue()
 	if err != nil {
@@ -172,17 +180,18 @@ func NewServer(config *Config) (*Server, error) {
 
 	// Create the server
 	s := &Server{
-		config:      config,
-		connPool:    NewPool(config.LogOutput, serverRPCCache, serverMaxStreams, nil),
-		logger:      logger,
-		rpcServer:   rpc.NewServer(),
-		peers:       make(map[string][]*serverParts),
-		localPeers:  make(map[string]*serverParts),
-		reconcileCh: make(chan serf.Member, 32),
-		eventCh:     make(chan serf.Event, 256),
-		evalBroker:  evalBroker,
-		planQueue:   planQueue,
-		shutdownCh:  make(chan struct{}),
+		config:       config,
+		connPool:     NewPool(config.LogOutput, serverRPCCache, serverMaxStreams, nil),
+		logger:       logger,
+		rpcServer:    rpc.NewServer(),
+		peers:        make(map[string][]*serverParts),
+		localPeers:   make(map[string]*serverParts),
+		reconcileCh:  make(chan serf.Member, 32),
+		eventCh:      make(chan serf.Event, 256),
+		evalBroker:   evalBroker,
+		blockedEvals: blockedEvals,
+		planQueue:    planQueue,
+		shutdownCh:   make(chan struct{}),
 	}
 
 	// Create the periodic dispatcher for launching periodic jobs.
@@ -233,8 +242,16 @@ func NewServer(config *Config) (*Server, error) {
 	// Emit metrics for the plan queue
 	go planQueue.EmitStats(time.Second, s.shutdownCh)
 
+	// Emit metrics for the blocked eval tracker.
+	go blockedEvals.EmitStats(time.Second, s.shutdownCh)
+
 	// Emit metrics
 	go s.heartbeatStats()
+
+	// Seed the global random.
+	if err := seedRandom(); err != nil {
+		return nil, err
+	}
 
 	// Done
 	return s, nil
@@ -357,13 +374,14 @@ func (s *Server) Leave() error {
 func (s *Server) setupRPC(tlsWrap tlsutil.DCWrapper) error {
 	// Create endpoints
 	s.endpoints.Status = &Status{s}
-	s.endpoints.Node = &Node{s}
+	s.endpoints.Node = &Node{srv: s}
 	s.endpoints.Job = &Job{s}
 	s.endpoints.Eval = &Eval{s}
 	s.endpoints.Plan = &Plan{s}
 	s.endpoints.Alloc = &Alloc{s}
 	s.endpoints.Region = &Region{s}
 	s.endpoints.Periodic = &Periodic{s}
+	s.endpoints.System = &System{s}
 
 	// Register the handlers
 	s.rpcServer.Register(s.endpoints.Status)
@@ -374,6 +392,7 @@ func (s *Server) setupRPC(tlsWrap tlsutil.DCWrapper) error {
 	s.rpcServer.Register(s.endpoints.Alloc)
 	s.rpcServer.Register(s.endpoints.Region)
 	s.rpcServer.Register(s.endpoints.Periodic)
+	s.rpcServer.Register(s.endpoints.System)
 
 	list, err := net.ListenTCP("tcp", s.config.RPCAddr)
 	if err != nil {
@@ -415,7 +434,7 @@ func (s *Server) setupRaft() error {
 
 	// Create the FSM
 	var err error
-	s.fsm, err = NewFSM(s.evalBroker, s.periodicDispatcher, s.config.LogOutput)
+	s.fsm, err = NewFSM(s.evalBroker, s.periodicDispatcher, s.blockedEvals, s.config.LogOutput)
 	if err != nil {
 		return err
 	}

@@ -18,15 +18,6 @@ on a port. Batch jobs or services that only make outbound connections do not
 need to allocate ports, since they will use any available interface to make an
 outbound connection.
 
-## IP Address
-
-Hosts in Nomad may have multiple network interfaces attached to them. This
-allows you to have a higher density of services, or bind to interfaces on
-different subnets (for example public vs. private subnets).
-
-Each task will receive port allocations on a single interface. The IP is passed
-to your job via the `NOMAD_IP` environment variable.
-
 ## Ports
 
 In addition to allocating an interface, Nomad can allocate static or dynamic
@@ -89,13 +80,13 @@ port "http" {}
 ```
 
 When the task is started, it is passed an environment variable named
-`NOMAD_PORT_http` which indicates the port.
+`NOMAD_ADDR_http` which indicates a combination of the interface IP and port.
 
 ```
-NOMAD_PORT_http=53423 ./start-command
+NOMAD_ADDR_http=127.0.0.1:53423 ./start-command
 ```
 
-### Mapped Ports
+### Mapped Ports <a id="mapped_ports"></a>
 
 Some drivers (such as Docker and QEMU) allow you to map ports. A mapped port
 means that your application can listen on a fixed port (it does not need to
@@ -117,5 +108,9 @@ config {
 The above example is for the Docker driver. The service is listening on port
 `8080` inside the container. The driver will automatically map the dynamic port
 to this service.
+
+When the task is started, it is passed an additional environment variable named
+`NOMAD_HOST_PORT_http` which indicates the host port that the http service is
+bound to.
 
 Please refer to the [Docker](/docs/drivers/docker.html) and [QEMU](/docs/drivers/qemu.html) drivers for additional information.

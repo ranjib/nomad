@@ -1,7 +1,9 @@
 package driver
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -25,7 +27,9 @@ func TestJavaDriver_Fingerprint(t *testing.T) {
 	driverCtx, _ := testDriverContexts(&structs.Task{Name: "foo"})
 	d := NewJavaDriver(driverCtx)
 	node := &structs.Node{
-		Attributes: make(map[string]string),
+		Attributes: map[string]string{
+			"unique.cgroup.mountpoint": "/sys/fs/cgroups",
+		},
 	}
 	apply, err := d.Fingerprint(&config.Config{}, node)
 	if err != nil {
@@ -58,6 +62,10 @@ func TestJavaDriver_StartOpen_Wait(t *testing.T) {
 			"jvm_options":     []string{"-Xmx64m", "-Xms32m"},
 			"checksum":        "sha256:58d6e8130308d32e197c5108edd4f56ddf1417408f743097c2e662df0f0b17c8",
 		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
 		Resources: basicResources,
 	}
 
@@ -87,6 +95,7 @@ func TestJavaDriver_StartOpen_Wait(t *testing.T) {
 	// There is a race condition between the handle waiting and killing. One
 	// will return an error.
 	handle.Kill()
+	handle2.Kill()
 }
 
 func TestJavaDriver_Start_Wait(t *testing.T) {
@@ -101,6 +110,10 @@ func TestJavaDriver_Start_Wait(t *testing.T) {
 		Config: map[string]interface{}{
 			"artifact_source": "https://dl.dropboxusercontent.com/u/47675/jar_thing/demoapp.jar",
 			"checksum":        "sha256:58d6e8130308d32e197c5108edd4f56ddf1417408f743097c2e662df0f0b17c8",
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -128,6 +141,16 @@ func TestJavaDriver_Start_Wait(t *testing.T) {
 		break
 	}
 
+	// Get the stdout of the process and assrt that it's not empty
+	stdout := filepath.Join(execCtx.AllocDir.LogDir(), "demo-app.stdout.0")
+	fInfo, err := os.Stat(stdout)
+	if err != nil {
+		t.Fatalf("failed to get stdout of process: %v", err)
+	}
+	if fInfo.Size() == 0 {
+		t.Fatalf("stdout of process is empty")
+	}
+
 	// need to kill long lived process
 	err = handle.Kill()
 	if err != nil {
@@ -146,6 +169,10 @@ func TestJavaDriver_Start_Kill_Wait(t *testing.T) {
 		Name: "demo-app",
 		Config: map[string]interface{}{
 			"artifact_source": "https://dl.dropboxusercontent.com/u/47675/jar_thing/demoapp.jar",
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -178,11 +205,10 @@ func TestJavaDriver_Start_Kill_Wait(t *testing.T) {
 		}
 	case <-time.After(time.Duration(testutil.TestMultiplier()*10) * time.Second):
 		t.Fatalf("timeout")
-	}
 
-	// need to kill long lived process
-	err = handle.Kill()
-	if err != nil {
-		t.Fatalf("Error: %s", err)
+		// Need to kill long lived process
+		if err = handle.Kill(); err != nil {
+			t.Fatalf("Error: %s", err)
+		}
 	}
 }

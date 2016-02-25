@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/gorhill/cronexpr"
-	"github.com/hashicorp/go-msgpack/codec"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/helper/args"
 	"github.com/mitchellh/copystructure"
+	"github.com/ugorji/go/codec"
+
+	hcodec "github.com/hashicorp/go-msgpack/codec"
 )
 
 var (
@@ -258,6 +260,11 @@ type PlanRequest struct {
 type AllocUpdateRequest struct {
 	// Alloc is the list of new allocations to assign
 	Alloc []*Allocation
+
+	// Job is the shared parent job of the allocations.
+	// It is pulled out since it is common to reduce payload size.
+	Job *Job
+
 	WriteRequest
 }
 
@@ -269,6 +276,12 @@ type AllocListRequest struct {
 // AllocSpecificRequest is used to query a specific allocation
 type AllocSpecificRequest struct {
 	AllocID string
+	QueryOptions
+}
+
+// AllocsGetcRequest is used to query a set of allocations
+type AllocsGetRequest struct {
+	AllocIDs []string
 	QueryOptions
 }
 
@@ -342,6 +355,12 @@ type NodeAllocsResponse struct {
 	QueryMeta
 }
 
+// NodeClientAllocsResponse is used to return allocs meta data for a single node
+type NodeClientAllocsResponse struct {
+	Allocs map[string]uint64
+	QueryMeta
+}
+
 // SingleNodeResponse is used to return a single node
 type SingleNodeResponse struct {
 	Node *Node
@@ -369,6 +388,12 @@ type JobListResponse struct {
 // SingleAllocResponse is used to return a single allocation
 type SingleAllocResponse struct {
 	Alloc *Allocation
+	QueryMeta
+}
+
+// AllocsGetResponse is used to return a set of allocations
+type AllocsGetResponse struct {
+	Allocs []*Allocation
 	QueryMeta
 }
 
@@ -506,7 +531,7 @@ type Node struct {
 
 	// ComputedClass is a unique id that identifies nodes with a common set of
 	// attributes and capabilities.
-	ComputedClass uint64
+	ComputedClass string
 
 	// Drain is controlled by the servers, and not the client.
 	// If true, no jobs will be scheduled to this node, and existing
@@ -522,6 +547,20 @@ type Node struct {
 	// Raft Indexes
 	CreateIndex uint64
 	ModifyIndex uint64
+}
+
+func (n *Node) Copy() *Node {
+	if n == nil {
+		return nil
+	}
+	nn := new(Node)
+	*nn = *n
+	nn.Attributes = CopyMapStringString(nn.Attributes)
+	nn.Resources = nn.Resources.Copy()
+	nn.Reserved = nn.Reserved.Copy()
+	nn.Links = CopyMapStringString(nn.Links)
+	nn.Meta = CopyMapStringString(nn.Meta)
+	return nn
 }
 
 // TerminalStatus returns if the current status is terminal and
@@ -574,8 +613,65 @@ type Resources struct {
 	Networks []*NetworkResource
 }
 
+// DefaultResources returns the minimum resources a task can use and be valid.
+func DefaultResources() *Resources {
+	return &Resources{
+		CPU:      100,
+		MemoryMB: 10,
+		DiskMB:   300,
+		IOPS:     0,
+	}
+}
+
+// Merge merges this resource with another resource.
+func (r *Resources) Merge(other *Resources) {
+	if other.CPU != 0 {
+		r.CPU = other.CPU
+	}
+	if other.MemoryMB != 0 {
+		r.MemoryMB = other.MemoryMB
+	}
+	if other.DiskMB != 0 {
+		r.DiskMB = other.DiskMB
+	}
+	if other.IOPS != 0 {
+		r.IOPS = other.IOPS
+	}
+	if len(other.Networks) != 0 {
+		r.Networks = other.Networks
+	}
+}
+
+// MeetsMinResources returns an error if the resources specified are less than
+// the minimum allowed.
+func (r *Resources) MeetsMinResources() error {
+	var mErr multierror.Error
+	if r.CPU < 20 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum CPU value is 20; got %d", r.CPU))
+	}
+	if r.MemoryMB < 10 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum MemoryMB value is 10; got %d", r.MemoryMB))
+	}
+	if r.DiskMB < 10 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum DiskMB value is 10; got %d", r.DiskMB))
+	}
+	if r.IOPS < 0 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum IOPS value is 0; got %d", r.IOPS))
+	}
+	for i, n := range r.Networks {
+		if err := n.MeetsMinResources(); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("network resource at index %d failed: %v", i, err))
+		}
+	}
+
+	return mErr.ErrorOrNil()
+}
+
 // Copy returns a deep copy of the resources
 func (r *Resources) Copy() *Resources {
+	if r == nil {
+		return nil
+	}
 	newR := new(Resources)
 	*newR = *r
 	n := len(r.Networks)
@@ -658,8 +754,21 @@ type NetworkResource struct {
 	DynamicPorts  []Port // Dynamically assigned ports
 }
 
+// MeetsMinResources returns an error if the resources specified are less than
+// the minimum allowed.
+func (n *NetworkResource) MeetsMinResources() error {
+	var mErr multierror.Error
+	if n.MBits < 1 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum MBits value is 1; got %d", n.MBits))
+	}
+	return mErr.ErrorOrNil()
+}
+
 // Copy returns a deep copy of the network resource
 func (n *NetworkResource) Copy() *NetworkResource {
+	if n == nil {
+		return nil
+	}
 	newR := new(NetworkResource)
 	*newR = *n
 	if n.ReservedPorts != nil {
@@ -819,12 +928,23 @@ func (j *Job) InitFields() {
 // Copy returns a deep copy of the Job. It is expected that callers use recover.
 // This job can panic if the deep copy failed as it uses reflection.
 func (j *Job) Copy() *Job {
-	i, err := copystructure.Copy(j)
-	if err != nil {
-		panic(err)
+	if j == nil {
+		return nil
 	}
+	nj := new(Job)
+	*nj = *j
+	nj.Datacenters = CopySliceString(nj.Datacenters)
+	nj.Constraints = CopySliceConstraints(nj.Constraints)
 
-	return i.(*Job)
+	tgs := make([]*TaskGroup, len(nj.TaskGroups))
+	for i, tg := range nj.TaskGroups {
+		tgs[i] = tg.Copy()
+	}
+	nj.TaskGroups = tgs
+
+	nj.Periodic = nj.Periodic.Copy()
+	nj.Meta = CopyMapStringString(nj.Meta)
+	return nj
 }
 
 // Validate is used to sanity check a job input
@@ -984,6 +1104,15 @@ type PeriodicConfig struct {
 	ProhibitOverlap bool `mapstructure:"prohibit_overlap"`
 }
 
+func (p *PeriodicConfig) Copy() *PeriodicConfig {
+	if p == nil {
+		return nil
+	}
+	np := new(PeriodicConfig)
+	*np = *p
+	return np
+}
+
 func (p *PeriodicConfig) Validate() error {
 	if !p.Enabled {
 		return nil
@@ -1064,18 +1193,16 @@ type PeriodicLaunch struct {
 
 var (
 	defaultServiceJobRestartPolicy = RestartPolicy{
-		Delay:            15 * time.Second,
-		Attempts:         2,
-		Interval:         1 * time.Minute,
-		RestartOnSuccess: true,
-		Mode:             RestartPolicyModeDelay,
+		Delay:    15 * time.Second,
+		Attempts: 2,
+		Interval: 1 * time.Minute,
+		Mode:     RestartPolicyModeDelay,
 	}
 	defaultBatchJobRestartPolicy = RestartPolicy{
-		Delay:            15 * time.Second,
-		Attempts:         15,
-		Interval:         7 * 24 * time.Hour,
-		RestartOnSuccess: false,
-		Mode:             RestartPolicyModeDelay,
+		Delay:    15 * time.Second,
+		Attempts: 15,
+		Interval: 7 * 24 * time.Hour,
+		Mode:     RestartPolicyModeDelay,
 	}
 )
 
@@ -1101,13 +1228,18 @@ type RestartPolicy struct {
 	// Delay is the time between a failure and a restart.
 	Delay time.Duration
 
-	// RestartOnSuccess determines whether a task should be restarted if it
-	// exited successfully.
-	RestartOnSuccess bool `mapstructure:"on_success"`
-
 	// Mode controls what happens when the task restarts more than attempt times
 	// in an interval.
 	Mode string
+}
+
+func (r *RestartPolicy) Copy() *RestartPolicy {
+	if r == nil {
+		return nil
+	}
+	nrp := new(RestartPolicy)
+	*nrp = *r
+	return nrp
 }
 
 func (r *RestartPolicy) Validate() error {
@@ -1115,6 +1247,11 @@ func (r *RestartPolicy) Validate() error {
 	case RestartPolicyModeDelay, RestartPolicyModeFail:
 	default:
 		return fmt.Errorf("Unsupported restart mode: %q", r.Mode)
+	}
+
+	// Check for ambiguous/confusing settings
+	if r.Attempts == 0 && r.Mode != RestartPolicyModeFail {
+		return fmt.Errorf("Restart policy %q with %d attempts is ambiguous", r.Mode, r.Attempts)
 	}
 
 	if r.Interval == 0 {
@@ -1162,6 +1299,26 @@ type TaskGroup struct {
 	// Meta is used to associate arbitrary metadata with this
 	// task group. This is opaque to Nomad.
 	Meta map[string]string
+}
+
+func (tg *TaskGroup) Copy() *TaskGroup {
+	if tg == nil {
+		return nil
+	}
+	ntg := new(TaskGroup)
+	*ntg = *tg
+	ntg.Constraints = CopySliceConstraints(ntg.Constraints)
+
+	ntg.RestartPolicy = ntg.RestartPolicy.Copy()
+
+	tasks := make([]*Task, len(ntg.Tasks))
+	for i, t := range ntg.Tasks {
+		tasks[i] = t.Copy()
+	}
+	ntg.Tasks = tasks
+
+	ntg.Meta = CopyMapStringString(ntg.Meta)
+	return ntg
 }
 
 // InitFields is used to initialize fields in the TaskGroup.
@@ -1258,6 +1415,15 @@ type ServiceCheck struct {
 	Timeout  time.Duration // Timeout of the response from the check before consul fails the check
 }
 
+func (sc *ServiceCheck) Copy() *ServiceCheck {
+	if sc == nil {
+		return nil
+	}
+	nsc := new(ServiceCheck)
+	*nsc = *sc
+	return nsc
+}
+
 func (sc *ServiceCheck) Validate() error {
 	t := strings.ToLower(sc.Type)
 	if t != ServiceCheckTCP && t != ServiceCheckHTTP {
@@ -1303,6 +1469,25 @@ type Service struct {
 	Checks    []*ServiceCheck // List of checks associated with the service
 }
 
+func (s *Service) Copy() *Service {
+	if s == nil {
+		return nil
+	}
+	ns := new(Service)
+	*ns = *s
+	ns.Tags = CopySliceString(ns.Tags)
+
+	var checks []*ServiceCheck
+	if l := len(ns.Checks); l != 0 {
+		checks = make([]*ServiceCheck, len(ns.Checks))
+		for i, c := range ns.Checks {
+			checks[i] = c.Copy()
+		}
+	}
+	ns.Checks = checks
+	return ns
+}
+
 // InitFields interpolates values of Job, Task Group and Task in the Service
 // Name. This also generates check names, service id and check ids.
 func (s *Service) InitFields(job string, taskGroup string, task string) {
@@ -1324,6 +1509,13 @@ func (s *Service) InitFields(job string, taskGroup string, task string) {
 // Validate checks if the Check definition is valid
 func (s *Service) Validate() error {
 	var mErr multierror.Error
+
+	// Ensure the name does not have a period in it.
+	// RFC-2782: https://tools.ietf.org/html/rfc2782
+	if strings.Contains(s.Name, ".") {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("service name can't contain periods: %q", s.Name))
+	}
+
 	for _, c := range s.Checks {
 		if err := c.Validate(); err != nil {
 			mErr.Errors = append(mErr.Errors, err)
@@ -1347,6 +1539,32 @@ const (
 	// will be killed and killing it.
 	DefaultKillTimeout = 5 * time.Second
 )
+
+// LogConfig provides configuration for log rotation
+type LogConfig struct {
+	MaxFiles      int `mapstructure:"max_files"`
+	MaxFileSizeMB int `mapstructure:"max_file_size"`
+}
+
+func DefaultLogConfig() *LogConfig {
+	return &LogConfig{
+		MaxFiles:      10,
+		MaxFileSizeMB: 10,
+	}
+}
+
+// Validate returns an error if the log config specified are less than
+// the minimum allowed.
+func (l *LogConfig) Validate() error {
+	var mErr multierror.Error
+	if l.MaxFiles < 1 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum number of files is 1; got %d", l.MaxFiles))
+	}
+	if l.MaxFileSizeMB < 1 {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("minimum file size is 1MB; got %d", l.MaxFileSizeMB))
+	}
+	return mErr.ErrorOrNil()
+}
 
 // Task is a single process typically that is executed as part of a task group.
 type Task struct {
@@ -1379,6 +1597,34 @@ type Task struct {
 	// KillTimeout is the time between signaling a task that it will be
 	// killed and killing it.
 	KillTimeout time.Duration `mapstructure:"kill_timeout"`
+
+	// LogConfig provides configuration for log rotation
+	LogConfig *LogConfig `mapstructure:"logs"`
+}
+
+func (t *Task) Copy() *Task {
+	if t == nil {
+		return nil
+	}
+	nt := new(Task)
+	*nt = *t
+	nt.Env = CopyMapStringString(nt.Env)
+
+	services := make([]*Service, len(nt.Services))
+	for i, s := range nt.Services {
+		services[i] = s.Copy()
+	}
+	nt.Services = services
+	nt.Constraints = CopySliceConstraints(nt.Constraints)
+
+	nt.Resources = nt.Resources.Copy()
+	nt.Meta = CopyMapStringString(nt.Meta)
+
+	if i, err := copystructure.Copy(nt.Config); err != nil {
+		nt.Config = i.(map[string]interface{})
+	}
+
+	return nt
 }
 
 // InitFields initializes fields in the task.
@@ -1430,10 +1676,27 @@ type TaskState struct {
 	Events []*TaskEvent
 }
 
+func (ts *TaskState) Copy() *TaskState {
+	if ts == nil {
+		return nil
+	}
+	copy := new(TaskState)
+	copy.State = ts.State
+	copy.Events = make([]*TaskEvent, len(ts.Events))
+	for i, e := range ts.Events {
+		copy.Events[i] = e.Copy()
+	}
+	return copy
+}
+
 const (
 	// A Driver failure indicates that the task could not be started due to a
 	// failure in the driver.
 	TaskDriverFailure = "Driver Failure"
+
+	// Task Received signals that the task has been pulled by the client at the
+	// given timestamp.
+	TaskReceived = "Received"
 
 	// Task Started signals that the task was started and its timestamp can be
 	// used to determine the running length of the task.
@@ -1462,6 +1725,15 @@ type TaskEvent struct {
 
 	// Task Killed Fields.
 	KillError string // Error killing the task.
+}
+
+func (te *TaskEvent) Copy() *TaskEvent {
+	if te == nil {
+		return nil
+	}
+	copy := new(TaskEvent)
+	*copy = *te
+	return copy
 }
 
 func NewTaskEvent(event string) *TaskEvent {
@@ -1511,12 +1783,24 @@ func (t *Task) Validate() error {
 	if t.Driver == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task driver"))
 	}
-	if t.Resources == nil {
-		mErr.Errors = append(mErr.Errors, errors.New("Missing task resources"))
-	}
 	if t.KillTimeout.Nanoseconds() < 0 {
 		mErr.Errors = append(mErr.Errors, errors.New("KillTimeout must be a positive value"))
 	}
+
+	// Validate the resources.
+	if t.Resources == nil {
+		mErr.Errors = append(mErr.Errors, errors.New("Missing task resources"))
+	} else if err := t.Resources.MeetsMinResources(); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	// Validate the log config
+	if t.LogConfig == nil {
+		mErr.Errors = append(mErr.Errors, errors.New("Missing Log Config"))
+	} else if err := t.LogConfig.Validate(); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
 	for idx, constr := range t.Constraints {
 		if err := constr.Validate(); err != nil {
 			outer := fmt.Errorf("Constraint %d validation failed: %s", idx+1, err)
@@ -1527,6 +1811,15 @@ func (t *Task) Validate() error {
 	for _, service := range t.Services {
 		if err := service.Validate(); err != nil {
 			mErr.Errors = append(mErr.Errors, err)
+		}
+	}
+
+	if t.LogConfig != nil && t.Resources != nil {
+		logUsage := (t.LogConfig.MaxFiles * t.LogConfig.MaxFileSizeMB)
+		if t.Resources.DiskMB <= logUsage {
+			mErr.Errors = append(mErr.Errors,
+				fmt.Errorf("log storage (%d MB) exceeds requested disk capacity (%d MB)",
+					logUsage, t.Resources.DiskMB))
 		}
 	}
 	return mErr.ErrorOrNil()
@@ -1544,6 +1837,15 @@ type Constraint struct {
 	RTarget string // Right-hand target
 	Operand string // Constraint operand (<=, <, =, !=, >, >=), contains, near
 	str     string // Memoized string
+}
+
+func (c *Constraint) Copy() *Constraint {
+	if c == nil {
+		return nil
+	}
+	nc := new(Constraint)
+	*nc = *c
+	return nc
 }
 
 func (c *Constraint) String() string {
@@ -1643,6 +1945,46 @@ type Allocation struct {
 	// Raft Indexes
 	CreateIndex uint64
 	ModifyIndex uint64
+
+	// AllocModifyIndex is not updated when the client updates allocations. This
+	// lets the client pull only the allocs updated by the server.
+	AllocModifyIndex uint64
+
+	// CreateTime is the time the allocation has finished scheduling and been
+	// verified by the plan applier.
+	CreateTime int64
+}
+
+func (a *Allocation) Copy() *Allocation {
+	if a == nil {
+		return nil
+	}
+	na := new(Allocation)
+	*na = *a
+
+	na.Job = na.Job.Copy()
+	na.Resources = na.Resources.Copy()
+
+	tr := make(map[string]*Resources, len(na.TaskResources))
+	for task, resource := range na.TaskResources {
+		tr[task] = resource.Copy()
+	}
+	na.TaskResources = tr
+
+	s := make(map[string]string, len(na.Services))
+	for service, id := range na.Services {
+		s[service] = id
+	}
+	na.Services = s
+
+	na.Metrics = na.Metrics.Copy()
+
+	ts := make(map[string]*TaskState, len(na.TaskStates))
+	for task, state := range na.TaskStates {
+		ts[task] = state.Copy()
+	}
+	na.TaskStates = ts
+	return na
 }
 
 // TerminalStatus returns if the desired or actual status is terminal and
@@ -1680,34 +2022,31 @@ func (a *Allocation) Stub() *AllocListStub {
 		TaskStates:         a.TaskStates,
 		CreateIndex:        a.CreateIndex,
 		ModifyIndex:        a.ModifyIndex,
+		CreateTime:         a.CreateTime,
 	}
 }
 
 // PopulateServiceIDs generates the service IDs for all the service definitions
 // in that Allocation
-func (a *Allocation) PopulateServiceIDs() {
-	// Make a copy of the old map which contains the service names and their
-	// generated IDs
-	oldIDs := make(map[string]string)
-	for k, v := range a.Services {
-		oldIDs[k] = v
-	}
-
+func (a *Allocation) PopulateServiceIDs(tg *TaskGroup) {
+	// Retain the old services, and re-initialize. We may be removing
+	// services, so we cannot update the existing map.
+	previous := a.Services
 	a.Services = make(map[string]string)
-	tg := a.Job.LookupTaskGroup(a.TaskGroup)
+
 	for _, task := range tg.Tasks {
 		for _, service := range task.Services {
-			// If the ID for a service name is already generated then we re-use
-			// it
-			if ID, ok := oldIDs[service.Name]; ok {
-				a.Services[service.Name] = ID
-			} else {
-				// If the service hasn't been generated an ID, we generate one.
-				// We add a prefix to the Service ID so that we can know that this service
-				// is managed by Nomad since Consul can also have service which are not
-				// managed by Nomad
-				a.Services[service.Name] = fmt.Sprintf("%s-%s", NomadConsulPrefix, GenerateUUID())
+			// Retain the service if an ID is already generated
+			if id, ok := previous[service.Name]; ok {
+				a.Services[service.Name] = id
+				continue
 			}
+
+			// If the service hasn't been generated an ID, we generate one.
+			// We add a prefix to the Service ID so that we can know that this service
+			// is managed by Nomad since Consul can also have service which are not
+			// managed by Nomad
+			a.Services[service.Name] = fmt.Sprintf("%s-%s", NomadConsulPrefix, GenerateUUID())
 		}
 	}
 }
@@ -1727,6 +2066,7 @@ type AllocListStub struct {
 	TaskStates         map[string]*TaskState
 	CreateIndex        uint64
 	ModifyIndex        uint64
+	CreateTime         int64
 }
 
 // AllocMetric is used to track various metrics while attempting
@@ -1771,6 +2111,21 @@ type AllocMetric struct {
 	// This is to prevent creating many failed allocations for a
 	// single task group.
 	CoalescedFailures int
+}
+
+func (a *AllocMetric) Copy() *AllocMetric {
+	if a == nil {
+		return nil
+	}
+	na := new(AllocMetric)
+	*na = *a
+	na.NodesAvailable = CopyMapStringInt(na.NodesAvailable)
+	na.ClassFiltered = CopyMapStringInt(na.ClassFiltered)
+	na.ConstraintFiltered = CopyMapStringInt(na.ConstraintFiltered)
+	na.ClassExhausted = CopyMapStringInt(na.ClassExhausted)
+	na.DimensionExhausted = CopyMapStringInt(na.DimensionExhausted)
+	na.Scores = CopyMapStringFloat64(na.Scores)
+	return na
 }
 
 func (a *AllocMetric) EvaluateNode() {
@@ -1818,9 +2173,11 @@ func (a *AllocMetric) ScoreNode(node *Node, name string, score float64) {
 }
 
 const (
-	EvalStatusPending  = "pending"
-	EvalStatusComplete = "complete"
-	EvalStatusFailed   = "failed"
+	EvalStatusBlocked   = "blocked"
+	EvalStatusPending   = "pending"
+	EvalStatusComplete  = "complete"
+	EvalStatusFailed    = "failed"
+	EvalStatusCancelled = "canceled"
 )
 
 const (
@@ -1829,6 +2186,7 @@ const (
 	EvalTriggerPeriodicJob   = "periodic-job"
 	EvalTriggerNodeUpdate    = "node-update"
 	EvalTriggerScheduled     = "scheduled"
+	EvalTriggerForceGC       = "force-gc"
 	EvalTriggerRollingUpdate = "rolling-update"
 )
 
@@ -1906,6 +2264,14 @@ type Evaluation struct {
 	// This is used to support rolling upgrades, where we need a chain of evaluations.
 	PreviousEval string
 
+	// ClassEligibility tracks computed node classes that have been explicitely
+	// marked as eligible or ineligible.
+	ClassEligibility map[string]bool
+
+	// EscapedComputedClass marks whether the job has constraints that are not
+	// captured by computed node classes.
+	EscapedComputedClass bool
+
 	// Raft Indexes
 	CreateIndex uint64
 	ModifyIndex uint64
@@ -1915,7 +2281,7 @@ type Evaluation struct {
 // will no longer transition.
 func (e *Evaluation) TerminalStatus() bool {
 	switch e.Status {
-	case EvalStatusComplete, EvalStatusFailed:
+	case EvalStatusComplete, EvalStatusFailed, EvalStatusCancelled:
 		return true
 	default:
 		return false
@@ -1927,17 +2293,34 @@ func (e *Evaluation) GoString() string {
 }
 
 func (e *Evaluation) Copy() *Evaluation {
+	if e == nil {
+		return nil
+	}
 	ne := new(Evaluation)
 	*ne = *e
 	return ne
 }
 
-// ShouldEnqueue checks if a given evaluation should be enqueued
+// ShouldEnqueue checks if a given evaluation should be enqueued into the
+// eval_broker
 func (e *Evaluation) ShouldEnqueue() bool {
 	switch e.Status {
 	case EvalStatusPending:
 		return true
-	case EvalStatusComplete, EvalStatusFailed:
+	case EvalStatusComplete, EvalStatusFailed, EvalStatusBlocked, EvalStatusCancelled:
+		return false
+	default:
+		panic(fmt.Sprintf("unhandled evaluation (%s) status %s", e.ID, e.Status))
+	}
+}
+
+// ShouldBlock checks if a given evaluation should be entered into the blocked
+// eval tracker.
+func (e *Evaluation) ShouldBlock() bool {
+	switch e.Status {
+	case EvalStatusBlocked:
+		return true
+	case EvalStatusComplete, EvalStatusFailed, EvalStatusPending, EvalStatusCancelled:
 		return false
 	default:
 		panic(fmt.Sprintf("unhandled evaluation (%s) status %s", e.ID, e.Status))
@@ -1950,6 +2333,7 @@ func (e *Evaluation) MakePlan(j *Job) *Plan {
 	p := &Plan{
 		EvalID:         e.ID,
 		Priority:       e.Priority,
+		Job:            j,
 		NodeUpdate:     make(map[string][]*Allocation),
 		NodeAllocation: make(map[string][]*Allocation),
 	}
@@ -1971,6 +2355,24 @@ func (e *Evaluation) NextRollingEval(wait time.Duration) *Evaluation {
 		Status:         EvalStatusPending,
 		Wait:           wait,
 		PreviousEval:   e.ID,
+	}
+}
+
+// BlockedEval creates a blocked evaluation to followup this eval to place any
+// failed allocations. It takes the classes marked explicitely eligible or
+// ineligible and whether the job has escaped computed node classes.
+func (e *Evaluation) BlockedEval(classEligibility map[string]bool, escaped bool) *Evaluation {
+	return &Evaluation{
+		ID:                   GenerateUUID(),
+		Priority:             e.Priority,
+		Type:                 e.Type,
+		TriggeredBy:          e.TriggeredBy,
+		JobID:                e.JobID,
+		JobModifyIndex:       e.JobModifyIndex,
+		Status:               EvalStatusBlocked,
+		PreviousEval:         e.ID,
+		ClassEligibility:     classEligibility,
+		EscapedComputedClass: escaped,
 	}
 }
 
@@ -1997,6 +2399,11 @@ type Plan struct {
 	// entire plan must be able to make progress.
 	AllAtOnce bool
 
+	// Job is the parent job of all the allocations in the Plan.
+	// Since a Plan only involves a single Job, we can reduce the size
+	// of the plan by only including it once.
+	Job *Job
+
 	// NodeUpdate contains all the allocations for each node. For each node,
 	// this is a list of the allocations to update to either stop or evict.
 	NodeUpdate map[string][]*Allocation
@@ -2014,6 +2421,15 @@ type Plan struct {
 func (p *Plan) AppendUpdate(alloc *Allocation, status, desc string) {
 	newAlloc := new(Allocation)
 	*newAlloc = *alloc
+
+	// If the job is not set in the plan we are deregistering a job so we
+	// extract the job from the allocation.
+	if p.Job == nil && newAlloc.Job != nil {
+		p.Job = newAlloc.Job
+	}
+
+	// Normalize the job
+	newAlloc.Job = nil
 	newAlloc.DesiredStatus = status
 	newAlloc.DesiredDescription = desc
 	node := alloc.NodeID
@@ -2095,6 +2511,16 @@ func (p *PlanResult) FullCommit(plan *Plan) (bool, int, int) {
 // msgpackHandle is a shared handle for encoding/decoding of structs
 var MsgpackHandle = func() *codec.MsgpackHandle {
 	h := &codec.MsgpackHandle{RawToString: true}
+
+	// Sets the default type for decoding a map into a nil interface{}.
+	// This is necessary in particular because we store the driver configs as a
+	// nil interface{}.
+	h.MapType = reflect.TypeOf(map[string]interface{}(nil))
+	return h
+}()
+
+var HashiMsgpackHandle = func() *hcodec.MsgpackHandle {
+	h := &hcodec.MsgpackHandle{RawToString: true}
 
 	// Sets the default type for decoding a map into a nil interface{}.
 	// This is necessary in particular because we store the driver configs as a

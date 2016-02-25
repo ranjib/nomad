@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/client"
+	clientconfig "github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/nomad"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -149,34 +150,9 @@ func (a *Agent) serverConfig() (*nomad.Config, error) {
 	return conf, nil
 }
 
-// setupServer is used to setup the server if enabled
-func (a *Agent) setupServer() error {
-	if !a.config.Server.Enabled {
-		return nil
-	}
-
-	// Setup the configuration
-	conf, err := a.serverConfig()
-	if err != nil {
-		return fmt.Errorf("server config setup failed: %s", err)
-	}
-
-	// Create the server
-	server, err := nomad.NewServer(conf)
-	if err != nil {
-		return fmt.Errorf("server setup failed: %v", err)
-	}
-
-	a.server = server
-	return nil
-}
-
-// setupClient is used to setup the client if enabled
-func (a *Agent) setupClient() error {
-	if !a.config.Client.Enabled {
-		return nil
-	}
-
+// clientConfig is used to generate a new client configuration struct
+// for initializing a nomad client.
+func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 	// Setup the configuration
 	conf := a.config.ClientConfig
 	if conf == nil {
@@ -211,10 +187,12 @@ func (a *Agent) setupClient() error {
 	if a.config.Client.MaxKillTimeout != "" {
 		dur, err := time.ParseDuration(a.config.Client.MaxKillTimeout)
 		if err != nil {
-			return fmt.Errorf("Error parsing retry interval: %s", err)
+			return nil, fmt.Errorf("Error parsing retry interval: %s", err)
 		}
 		conf.MaxKillTimeout = dur
 	}
+	conf.ClientMaxPort = a.config.Client.ClientMaxPort
+	conf.ClientMinPort = a.config.Client.ClientMinPort
 
 	// Setup the node
 	conf.Node = new(structs.Node)
@@ -224,19 +202,60 @@ func (a *Agent) setupClient() error {
 	conf.Node.NodeClass = a.config.Client.NodeClass
 	httpAddr := fmt.Sprintf("%s:%d", a.config.BindAddr, a.config.Ports.HTTP)
 	if a.config.Addresses.HTTP != "" && a.config.AdvertiseAddrs.HTTP == "" {
-		addr, err := net.ResolveTCPAddr("tcp", a.config.Addresses.HTTP)
-		if err != nil {
-			return fmt.Errorf("error resolving http addr: %v:", err)
+		httpAddr = fmt.Sprintf("%s:%d", a.config.Addresses.HTTP, a.config.Ports.HTTP)
+		if _, err := net.ResolveTCPAddr("tcp", httpAddr); err != nil {
+			return nil, fmt.Errorf("error resolving http addr: %v:", err)
 		}
-		httpAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 	} else if a.config.AdvertiseAddrs.HTTP != "" {
 		addr, err := net.ResolveTCPAddr("tcp", a.config.AdvertiseAddrs.HTTP)
 		if err != nil {
-			return fmt.Errorf("error resolving advertise http addr: %v", err)
+			return nil, fmt.Errorf("error resolving advertise http addr: %v", err)
 		}
 		httpAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 	}
 	conf.Node.HTTPAddr = httpAddr
+	conf.Version = a.config.Version
+	return conf, nil
+}
+
+// setupServer is used to setup the server if enabled
+func (a *Agent) setupServer() error {
+	if !a.config.Server.Enabled {
+		return nil
+	}
+
+	// Setup the configuration
+	conf, err := a.serverConfig()
+	if err != nil {
+		return fmt.Errorf("server config setup failed: %s", err)
+	}
+
+	// Create the server
+	server, err := nomad.NewServer(conf)
+	if err != nil {
+		return fmt.Errorf("server setup failed: %v", err)
+	}
+
+	a.server = server
+	return nil
+}
+
+// setupClient is used to setup the client if enabled
+func (a *Agent) setupClient() error {
+	if !a.config.Client.Enabled {
+		return nil
+	}
+
+	// Setup the configuration
+	conf, err := a.clientConfig()
+	if err != nil {
+		return fmt.Errorf("client setup failed: %v", err)
+	}
+
+	// Reserve some ports for the plugins
+	if err := a.reservePortsForClient(conf); err != nil {
+		return err
+	}
 
 	// Create the client
 	client, err := client.NewClient(conf)
@@ -245,6 +264,77 @@ func (a *Agent) setupClient() error {
 	}
 	a.client = client
 	return nil
+}
+
+// reservePortsForClient reservers a range of ports for the client to use when
+// it creates various plugins for log collection, executors, drivers, etc
+func (a *Agent) reservePortsForClient(conf *clientconfig.Config) error {
+	// finding the device name for loopback
+	deviceName, addr, mask, err := a.findLoopbackDevice()
+	if err != nil {
+		return fmt.Errorf("error finding the device name for loopback: %v", err)
+	}
+
+	// seeing if the user has already reserved some resources on this device
+	var nr *structs.NetworkResource
+	if conf.Node.Reserved == nil {
+		conf.Node.Reserved = &structs.Resources{}
+	}
+	for _, n := range conf.Node.Reserved.Networks {
+		if n.Device == deviceName {
+			nr = n
+		}
+	}
+	// If the user hasn't already created the device, we create it
+	if nr == nil {
+		nr = &structs.NetworkResource{
+			Device:        deviceName,
+			IP:            addr,
+			CIDR:          mask,
+			ReservedPorts: make([]structs.Port, 0),
+		}
+	}
+	// appending the port ranges we want to use for the client to the list of
+	// reserved ports for this device
+	for i := conf.ClientMinPort; i <= conf.ClientMaxPort; i++ {
+		nr.ReservedPorts = append(nr.ReservedPorts, structs.Port{Label: fmt.Sprintf("plugin-%d", i), Value: int(i)})
+	}
+	conf.Node.Reserved.Networks = append(conf.Node.Reserved.Networks, nr)
+	return nil
+}
+
+// findLoopbackDevice iterates through all the interfaces on a machine and
+// returns the ip addr, mask of the loopback device
+func (a *Agent) findLoopbackDevice() (string, string, string, error) {
+	var ifcs []net.Interface
+	var err error
+	ifcs, err = net.Interfaces()
+	if err != nil {
+		return "", "", "", err
+	}
+	for _, ifc := range ifcs {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			return "", "", "", err
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip.IsLoopback() {
+				if ip.To4() == nil {
+					continue
+				}
+				return ifc.Name, ip.String(), addr.String(), nil
+			}
+		}
+	}
+
+	return "", "", "", fmt.Errorf("no loopback devices with IPV4 addr found")
 }
 
 // Leave is used gracefully exit. Clients will inform servers

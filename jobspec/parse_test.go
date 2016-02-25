@@ -58,6 +58,7 @@ func TestParse(t *testing.T) {
 								Meta: map[string]string{
 									"my-cool-key": "foobar",
 								},
+								LogConfig: structs.DefaultLogConfig(),
 							},
 						},
 					},
@@ -78,11 +79,10 @@ func TestParse(t *testing.T) {
 							"elb_checks":   "3",
 						},
 						RestartPolicy: &structs.RestartPolicy{
-							Interval:         10 * time.Minute,
-							Attempts:         5,
-							Delay:            15 * time.Second,
-							RestartOnSuccess: true,
-							Mode:             "delay",
+							Interval: 10 * time.Minute,
+							Attempts: 5,
+							Delay:    15 * time.Second,
+							Mode:     "delay",
 						},
 						Tasks: []*structs.Task{
 							&structs.Task{
@@ -113,6 +113,8 @@ func TestParse(t *testing.T) {
 								Resources: &structs.Resources{
 									CPU:      500,
 									MemoryMB: 128,
+									DiskMB:   300,
+									IOPS:     0,
 									Networks: []*structs.NetworkResource{
 										&structs.NetworkResource{
 											MBits:         100,
@@ -122,6 +124,10 @@ func TestParse(t *testing.T) {
 									},
 								},
 								KillTimeout: 22 * time.Second,
+								LogConfig: &structs.LogConfig{
+									MaxFiles:      10,
+									MaxFileSizeMB: 100,
+								},
 							},
 							&structs.Task{
 								Name:   "storagelocker",
@@ -132,6 +138,8 @@ func TestParse(t *testing.T) {
 								Resources: &structs.Resources{
 									CPU:      500,
 									MemoryMB: 128,
+									DiskMB:   300,
+									IOPS:     30,
 								},
 								Constraints: []*structs.Constraint{
 									&structs.Constraint{
@@ -140,6 +148,7 @@ func TestParse(t *testing.T) {
 										Operand: "=",
 									},
 								},
+								LogConfig: structs.DefaultLogConfig(),
 							},
 						},
 					},
@@ -280,6 +289,10 @@ func TestParse(t *testing.T) {
 											"db": 1234,
 										},
 									},
+								},
+								LogConfig: &structs.LogConfig{
+									MaxFiles:      10,
+									MaxFileSizeMB: 10,
 								},
 							},
 						},

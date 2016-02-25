@@ -93,7 +93,7 @@ where a task is eligible for running. An example constraint looks like:
 ```
 # Restrict to only nodes running linux
 constraint {
-    attribute = "$attr.kernel.name"
+    attribute = "${attr.kernel.name}"
     value = "linux"
 }
 ```
@@ -238,13 +238,13 @@ The `task` object supports the following keys:
 * `service` - Nomad integrates with Consul for service discovery. A service
   block represents a routable and discoverable service on the network. Nomad
   automatically registers when a task is started and de-registers it when the
-  task transitons to the dead state. [Click
+  task transitions to the dead state. [Click
   here](/docs/jobspec/servicediscovery.html) to learn more about services.
 
 *   `env` - A map of key/value representing environment variables that
     will be passed along to the running process. Nomad variables are
     interpreted when set in the environment variable values. See the table of
-    interpreted variables [here](#interpreted_vars).
+    interpreted variables [here](/docs/jobspec/interpreted.html).
 
     For example the below environment map will be reinterpreted:
 
@@ -252,7 +252,7 @@ The `task` object supports the following keys:
         env {
             // The value will be interpreted by the client and set to the
             // correct value.
-            NODE_CLASS = "$nomad.class"
+            NODE_CLASS = "${nomad.class}"
         }
     ```
 
@@ -264,6 +264,9 @@ The `task` object supports the following keys:
 * `kill_timeout` - `kill_timeout` is a time duration that can be specified using
   the `s`, `m`, and `h` suffixes, such as `30s`. It can be used to configure the
   time between signaling a task it will be killed and actually killing it.
+
+* `logs` - Logs allows configuring log rotation for the `stdout` and `stderr`
+  buffers of a Task. See the log rotation reference below for more details.
 
 ### Resources
 
@@ -307,10 +310,7 @@ The `restart` object supports the following keys:
 
 * `delay` - A duration to wait before restarting a task. It is specified as a
   time duration using the `s`, `m`, and `h` suffixes, such as `30s`. A random
-  jitter of up to 25% is added to the the delay.
-
-* `on_success` - `on_success` controls whether a task is restarted when the
-  task exits successfully.
+  jitter of up to 25% is added to the delay.
 
 *   `mode` - Controls the behavior when the task fails more than `attempts`
     times in an interval. Possible values are listed below:
@@ -327,7 +327,6 @@ restart {
     attempts = 15
     delay = "15s"
     interval = "168h" # 7 days
-    on_success = false
     mode = "delay"
 }
 ```
@@ -339,7 +338,6 @@ restart {
     interval = "1m"
     attempts = 2
     delay = "15s"
-    on_success = true
     mode = "delay"
 }
 ```
@@ -349,7 +347,7 @@ restart {
 The `constraint` object supports the following keys:
 
 * `attribute` - Specifies the attribute to examine for the
-  constraint. See the table of attributes [below](#interpreted_vars).
+  constraint. See the table of attributes [here](/docs/jobspec/interpreted.html#interpreted_node_vars).
 
 * `operator` - Specifies the comparison operator. Defaults to equality,
   and can be `=`, `==`, `is`, `!=`, `not`, `>`, `>=`, `<`, `<=`. The
@@ -381,95 +379,31 @@ The `constraint` object supports the following keys:
 
     Tasks within a task group are always co-scheduled.
 
-### Interpreted Variables <a id="interpreted_vars"></a>
+### Log Rotation
 
-Certain Nomad variables are interpretable for use in constraints, task
-environment variables and task arguments. Below is a table documenting the
-variables that can be interpreted:
+The `logs` object configures the log rotation policy for a task's `stdout` and
+`stderr`. The `logs` object supports the following keys:
 
-<table class="table table-bordered table-striped">
-  <tr>
-    <th>Variable</th>
-    <th>Description</th>
-  </tr>
-  <tr>
-    <td>$node.id</td>
-    <td>The client node identifier</td>
-  </tr>
-  <tr>
-    <td>$node.datacenter</td>
-    <td>The client node datacenter</td>
-  </tr>
-  <tr>
-    <td>$node.name</td>
-    <td>The client node name</td>
-  </tr>
-  <tr>
-    <td>$node.class</td>
-    <td>The client node class</td>
-  </tr>
-  <tr>
-    <td>$attr.\<key\></td>
-    <td>The attribute given by `key` on the client node.</td>
-  </tr>
-  <tr>
-    <td>$meta.\<key\></td>
-    <td>The metadata value given by `key` on the client node.</td>
-  </tr>
-</table>
+* `max_files` - The maximum number of rotated files Nomad will retain for
+  `stdout` and `stderr`, each tracked individually.
 
-Below is a table documenting common node attributes:
+* `max_file_size` - The size of each rotated file. The size is specified in
+  `MB`.
 
-<table class="table table-bordered table-striped">
-  <tr>
-    <th>Attribute</th>
-    <th>Description</th>
-  </tr>
-  <tr>
-    <td>arch</td>
-    <td>CPU architecture of the client. Examples: `amd64`, `386`</td>
-  </tr>
-  <tr>
-    <td>consul.datacenter</td>
-    <td>The Consul datacenter of the client node if Consul found</td>
-  </tr>
-  <tr>
-    <td>cpu.numcores</td>
-    <td>Number of CPU cores on the client</td>
-  </tr>
-  <tr>
-    <td>driver.\<key\></td>
-    <td>See the [task drivers](/docs/drivers/index.html) for attribute documentation</td>
-  </tr>
-  <tr>
-    <td>hostname</td>
-    <td>Hostname of the client</td>
-  </tr>
-  <tr>
-    <td>kernel.name</td>
-    <td>Kernel of the client. Examples: `linux`, `darwin`</td>
-  </tr>
-  <tr>
-    <td>kernel.version</td>
-    <td>Version of the client kernel. Examples: `3.19.0-25-generic`, `15.0.0`</td>
-  </tr>
-  <tr>
-    <td>platform.aws.ami-id</td>
-    <td>On EC2, the AMI ID of the client node</td>
-  </tr>
-  <tr>
-    <td>platform.aws.instance-type</td>
-    <td>On EC2, the instance type of the client node</td>
-  </tr>
-  <tr>
-    <td>os.name</td>
-    <td>Operating system of the client. Examples: `ubuntu`, `windows`, `darwin`</td>
-  </tr>
-  <tr>
-    <td>os.version</td>
-    <td>Version of the client OS</td>
-  </tr>
-</table>
+If the amount of disk resource requested for the task is less than the total
+amount of disk space needed to retain the rotated set of files, Nomad will return
+a validation error when a job is submitted.
+
+```
+logs {
+    max_files = 3
+    max_file_size = 10
+}
+```
+
+In the above example we have asked Nomad to retain 3 rotated files for both
+`stderr` and `stdout` and size of each file is 10MB. The minimum disk space that
+would be required for the task would be 60MB.
 
 ## JSON Syntax
 

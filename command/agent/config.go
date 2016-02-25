@@ -159,6 +159,14 @@ type ClientConfig struct {
 
 	// MaxKillTimeout allows capping the user-specifiable KillTimeout.
 	MaxKillTimeout string `hcl:"max_kill_timeout"`
+
+	// ClientMaxPort is the upper range of the ports that the client uses for
+	// communicating with plugin subsystems
+	ClientMaxPort uint `hcl:"client_max_port"`
+
+	// ClientMinPort is the lower range of the ports that the client uses for
+	// communicating with plugin subsystems
+	ClientMinPort uint `hcl:"client_min_port"`
 }
 
 // ServerConfig is configuration specific to the server mode
@@ -288,6 +296,8 @@ func DefaultConfig() *Config {
 			Enabled:        false,
 			NetworkSpeed:   100,
 			MaxKillTimeout: "30s",
+			ClientMinPort:  14000,
+			ClientMaxPort:  14512,
 		},
 		Server: &ServerConfig{
 			Enabled:          false,
@@ -505,6 +515,12 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	if b.MaxKillTimeout != "" {
 		result.MaxKillTimeout = b.MaxKillTimeout
 	}
+	if b.ClientMaxPort != 0 {
+		result.ClientMaxPort = b.ClientMaxPort
+	}
+	if b.ClientMinPort != 0 {
+		result.ClientMinPort = b.ClientMinPort
+	}
 
 	// Add the servers
 	result.Servers = append(result.Servers, b.Servers...)
@@ -585,6 +601,9 @@ func (a *AdvertiseAddrs) Merge(b *AdvertiseAddrs) *AdvertiseAddrs {
 	}
 	if b.Serf != "" {
 		result.Serf = b.Serf
+	}
+	if b.HTTP != "" {
+		result.HTTP = b.HTTP
 	}
 	return &result
 }

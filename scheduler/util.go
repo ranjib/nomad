@@ -208,8 +208,10 @@ func readyNodesInDCs(state State, dcs []string) ([]*structs.Node, map[string]int
 }
 
 // retryMax is used to retry a callback until it returns success or
-// a maximum number of attempts is reached
-func retryMax(max int, cb func() (bool, error)) error {
+// a maximum number of attempts is reached. An optional reset function may be
+// passed which is called after each failed iteration. If the reset function is
+// set and returns true, the number of attempts is reset back to max.
+func retryMax(max int, cb func() (bool, error), reset func() bool) error {
 	attempts := 0
 	for attempts < max {
 		done, err := cb()
@@ -219,12 +221,25 @@ func retryMax(max int, cb func() (bool, error)) error {
 		if done {
 			return nil
 		}
-		attempts += 1
+
+		// Check if we should reset the number attempts
+		if reset != nil && reset() {
+			attempts = 0
+		} else {
+			attempts += 1
+		}
 	}
 	return &SetStatusError{
 		Err:        fmt.Errorf("maximum attempts reached (%d)", max),
 		EvalStatus: structs.EvalStatusFailed,
 	}
+}
+
+// progressMade checks to see if the plan result made allocations or updates.
+// If the result is nil, false is returned.
+func progressMade(result *structs.PlanResult) bool {
+	return result != nil && (len(result.NodeUpdate) != 0 ||
+		len(result.NodeAllocation) != 0)
 }
 
 // taintedNodes is used to scan the allocations and then check if the
@@ -376,13 +391,13 @@ func inplaceUpdate(ctx Context, eval *structs.Evaluation, job *structs.Job,
 
 		// Update the allocation
 		newAlloc.EvalID = eval.ID
-		newAlloc.Job = job
+		newAlloc.Job = nil // Use the Job in the Plan
 		newAlloc.Resources = size
 		newAlloc.TaskResources = option.TaskResources
 		newAlloc.Metrics = ctx.Metrics()
 		newAlloc.DesiredStatus = structs.AllocDesiredStatusRun
 		newAlloc.ClientStatus = structs.AllocClientStatusPending
-		newAlloc.PopulateServiceIDs()
+		newAlloc.PopulateServiceIDs(update.TaskGroup)
 		ctx.Plan().AppendAlloc(newAlloc)
 
 		// Remove this allocation from the slice

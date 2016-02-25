@@ -93,8 +93,8 @@ func TestJob_Validate(t *testing.T) {
 	}
 }
 
-func TestJob_Copy(t *testing.T) {
-	j := &Job{
+func testJob() *Job {
+	return &Job{
 		Region:      "global",
 		ID:          GenerateUUID(),
 		Name:        "my-job",
@@ -160,10 +160,13 @@ func TestJob_Copy(t *testing.T) {
 			"owner": "armon",
 		},
 	}
+}
 
+func TestJob_Copy(t *testing.T) {
+	j := testJob()
 	c := j.Copy()
 	if !reflect.DeepEqual(j, c) {
-		t.Fatalf("Copy() returned an unequal Job; got %v; want %v", c, j)
+		t.Fatalf("Copy() returned an unequal Job; got %#v; want %#v", c, j)
 	}
 }
 
@@ -189,11 +192,10 @@ func TestJob_IsPeriodic(t *testing.T) {
 func TestTaskGroup_Validate(t *testing.T) {
 	tg := &TaskGroup{
 		RestartPolicy: &RestartPolicy{
-			Interval:         5 * time.Minute,
-			Delay:            10 * time.Second,
-			Attempts:         10,
-			RestartOnSuccess: true,
-			Mode:             RestartPolicyModeDelay,
+			Interval: 5 * time.Minute,
+			Delay:    10 * time.Second,
+			Attempts: 10,
+			Mode:     RestartPolicyModeDelay,
 		},
 	}
 	err := tg.Validate()
@@ -217,11 +219,10 @@ func TestTaskGroup_Validate(t *testing.T) {
 			&Task{},
 		},
 		RestartPolicy: &RestartPolicy{
-			Interval:         5 * time.Minute,
-			Delay:            10 * time.Second,
-			Attempts:         10,
-			RestartOnSuccess: true,
-			Mode:             RestartPolicyModeDelay,
+			Interval: 5 * time.Minute,
+			Delay:    10 * time.Second,
+			Attempts: 10,
+			Mode:     RestartPolicyModeDelay,
 		},
 	}
 	err = tg.Validate()
@@ -252,12 +253,33 @@ func TestTask_Validate(t *testing.T) {
 	}
 
 	task = &Task{
-		Name:      "web",
-		Driver:    "docker",
-		Resources: &Resources{},
+		Name:   "web",
+		Driver: "docker",
+		Resources: &Resources{
+			CPU:      100,
+			DiskMB:   200,
+			MemoryMB: 100,
+			IOPS:     10,
+		},
+		LogConfig: DefaultLogConfig(),
 	}
 	err = task.Validate()
 	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestTask_Validate_LogConfig(t *testing.T) {
+	task := &Task{
+		LogConfig: DefaultLogConfig(),
+		Resources: &Resources{
+			DiskMB: 1,
+		},
+	}
+
+	err := task.Validate()
+	mErr := err.(*multierror.Error)
+	if !strings.Contains(mErr.Errors[3].Error(), "log storage") {
 		t.Fatalf("err: %s", err)
 	}
 }
@@ -467,6 +489,23 @@ func TestEncodeDecode(t *testing.T) {
 	}
 }
 
+func BenchmarkEncodeDecode(b *testing.B) {
+	job := testJob()
+
+	for i := 0; i < b.N; i++ {
+		buf, err := Encode(1, job)
+		if err != nil {
+			b.Fatalf("err: %v", err)
+		}
+
+		var out Job
+		err = Decode(buf[1:], &out)
+		if err != nil {
+			b.Fatalf("err: %v", err)
+		}
+	}
+}
+
 func TestInvalidServiceCheck(t *testing.T) {
 	s := Service{
 		Name:      "service-name",
@@ -481,6 +520,14 @@ func TestInvalidServiceCheck(t *testing.T) {
 	}
 	if err := s.Validate(); err == nil {
 		t.Fatalf("Service should be invalid")
+	}
+
+	s = Service{
+		Name:      "service.name",
+		PortLabel: "bar",
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatalf("Service should be invalid: %v", err)
 	}
 }
 
@@ -647,5 +694,45 @@ func TestPeriodicConfig_NextCron(t *testing.T) {
 		if expected[i] != n {
 			t.Fatalf("Next(%v) returned %v; want %v", from, n, expected[i])
 		}
+	}
+}
+
+func TestRestartPolicy_Validate(t *testing.T) {
+	// Policy with acceptable restart options passes
+	p := &RestartPolicy{
+		Mode:     RestartPolicyModeFail,
+		Attempts: 0,
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Policy with ambiguous restart options fails
+	p = &RestartPolicy{
+		Mode:     RestartPolicyModeDelay,
+		Attempts: 0,
+	}
+	if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("expect ambiguity error, got: %v", err)
+	}
+
+	// Bad policy mode fails
+	p = &RestartPolicy{
+		Mode:     "nope",
+		Attempts: 1,
+	}
+	if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("expect mode error, got: %v", err)
+	}
+
+	// Fails when attempts*delay does not fit inside interval
+	p = &RestartPolicy{
+		Mode:     RestartPolicyModeDelay,
+		Attempts: 3,
+		Delay:    5 * time.Second,
+		Interval: time.Second,
+	}
+	if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "can't restart") {
+		t.Fatalf("expect restart interval error, got: %v", err)
 	}
 }

@@ -24,8 +24,8 @@ import (
 )
 
 var (
-	reRktVersion  = regexp.MustCompile(`rkt version (\d[.\d]+)`)
-	reAppcVersion = regexp.MustCompile(`appc version (\d[.\d]+)`)
+	reRktVersion  = regexp.MustCompile(`rkt [vV]ersion[:]? (\d[.\d]+)`)
+	reAppcVersion = regexp.MustCompile(`appc [vV]ersion[:]? (\d[.\d]+)`)
 )
 
 const (
@@ -278,6 +278,9 @@ func (h *rktHandle) WaitCh() chan *cstructs.WaitResult {
 }
 
 func (h *rktHandle) Update(task *structs.Task) error {
+	// Store the updated kill timeout.
+	h.killTimeout = task.KillTimeout
+
 	// Update is not possible
 	return nil
 }

@@ -40,7 +40,15 @@ func testServer(
 
 func testJob(jobID string) *api.Job {
 	task := api.NewTask("task1", "exec").
-		Require(&api.Resources{MemoryMB: 256})
+		Require(&api.Resources{
+			MemoryMB: 256,
+			DiskMB:   20,
+			CPU:      100,
+		}).
+		SetLogConfig(&api.LogConfig{
+			MaxFiles:      1,
+			MaxFileSizeMB: 2,
+		})
 
 	group := api.NewTaskGroup("group1", 1).
 		AddTask(task)

@@ -10,6 +10,11 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+const (
+	// workerPoolSize is the size of the worker pool
+	workerPoolSize = 2
+)
+
 // planWaitFuture is used to wait for the Raft future to complete
 func planWaitFuture(future raft.ApplyFuture) (uint64, error) {
 	if err := future.Error(); err != nil {
@@ -61,7 +66,7 @@ func TestPlanApply_applyPlan(t *testing.T) {
 	}
 
 	// Apply the plan
-	future, err := s1.applyPlan(plan, snap)
+	future, err := s1.applyPlan(alloc.Job, plan, snap)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -102,7 +107,10 @@ func TestPlanApply_applyPlan(t *testing.T) {
 	allocEvict := new(structs.Allocation)
 	*allocEvict = *alloc
 	allocEvict.DesiredStatus = structs.AllocDesiredStatusEvict
+	job := allocEvict.Job
+	allocEvict.Job = nil
 	alloc2 := mock.Alloc()
+	alloc2.Job = nil
 	plan = &structs.PlanResult{
 		NodeUpdate: map[string][]*structs.Allocation{
 			node.ID: []*structs.Allocation{allocEvict},
@@ -119,7 +127,7 @@ func TestPlanApply_applyPlan(t *testing.T) {
 	}
 
 	// Apply the plan
-	future, err = s1.applyPlan(plan, snap)
+	future, err = s1.applyPlan(job, plan, snap)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -146,6 +154,9 @@ func TestPlanApply_applyPlan(t *testing.T) {
 	if out.DesiredStatus != structs.AllocDesiredStatusEvict {
 		t.Fatalf("should be evicted alloc: %#v", out)
 	}
+	if out.Job == nil {
+		t.Fatalf("missing job")
+	}
 
 	// Lookup the allocation
 	out, err = s1.fsm.State().AllocByID(alloc2.ID)
@@ -154,6 +165,9 @@ func TestPlanApply_applyPlan(t *testing.T) {
 	}
 	if out == nil {
 		t.Fatalf("missing alloc")
+	}
+	if out.Job == nil {
+		t.Fatalf("missing job")
 	}
 }
 
@@ -172,7 +186,10 @@ func TestPlanApply_EvalPlan_Simple(t *testing.T) {
 		FailedAllocs: []*structs.Allocation{allocFail},
 	}
 
-	result, err := evaluatePlan(snap, plan)
+	pool := NewEvaluatePool(workerPoolSize, workerPoolBufferSize)
+	defer pool.Shutdown()
+
+	result, err := evaluatePlan(pool, snap, plan)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -202,7 +219,10 @@ func TestPlanApply_EvalPlan_Partial(t *testing.T) {
 		},
 	}
 
-	result, err := evaluatePlan(snap, plan)
+	pool := NewEvaluatePool(workerPoolSize, workerPoolBufferSize)
+	defer pool.Shutdown()
+
+	result, err := evaluatePlan(pool, snap, plan)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -215,6 +235,9 @@ func TestPlanApply_EvalPlan_Partial(t *testing.T) {
 	}
 	if _, ok := result.NodeAllocation[node2.ID]; ok {
 		t.Fatalf("should not allow alloc2")
+	}
+	if result.RefreshIndex != 1001 {
+		t.Fatalf("bad: %d", result.RefreshIndex)
 	}
 }
 
@@ -237,7 +260,10 @@ func TestPlanApply_EvalPlan_Partial_AllAtOnce(t *testing.T) {
 		},
 	}
 
-	result, err := evaluatePlan(snap, plan)
+	pool := NewEvaluatePool(workerPoolSize, workerPoolBufferSize)
+	defer pool.Shutdown()
+
+	result, err := evaluatePlan(pool, snap, plan)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -247,6 +273,9 @@ func TestPlanApply_EvalPlan_Partial_AllAtOnce(t *testing.T) {
 
 	if len(result.NodeAllocation) != 0 {
 		t.Fatalf("should not alloc: %v", result.NodeAllocation)
+	}
+	if result.RefreshIndex != 1001 {
+		t.Fatalf("bad: %d", result.RefreshIndex)
 	}
 }
 

@@ -61,6 +61,10 @@ func TestRawExecDriver_StartOpen_Wait(t *testing.T) {
 			"command": testtask.Path(),
 			"args":    []string{"sleep", "1s"},
 		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
 		Resources: basicResources,
 	}
 	testtask.SetTaskEnv(task)
@@ -91,6 +95,8 @@ func TestRawExecDriver_StartOpen_Wait(t *testing.T) {
 	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
 		t.Fatalf("timeout")
 	}
+	handle.Kill()
+	handle2.Kill()
 }
 
 func TestRawExecDriver_Start_Artifact_basic(t *testing.T) {
@@ -104,55 +110,12 @@ func TestRawExecDriver_Start_Artifact_basic(t *testing.T) {
 		Name: "sleep",
 		Config: map[string]interface{}{
 			"artifact_source": fmt.Sprintf("%s/%s", ts.URL, file),
-			"command":         filepath.Join("$NOMAD_TASK_DIR", file),
+			"command":         file,
 			"args":            []string{"sleep", "1s"},
 		},
-		Resources: basicResources,
-	}
-	testtask.SetTaskEnv(task)
-
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewRawExecDriver(driverCtx)
-
-	handle, err := d.Start(execCtx, task)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if handle == nil {
-		t.Fatalf("missing handle")
-	}
-
-	// Attempt to open
-	handle2, err := d.Open(execCtx, handle.ID())
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if handle2 == nil {
-		t.Fatalf("missing handle")
-	}
-
-	// Task should terminate quickly
-	select {
-	case <-handle2.WaitCh():
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
-		t.Fatalf("timeout")
-	}
-}
-
-func TestRawExecDriver_Start_Artifact_expanded(t *testing.T) {
-	t.Parallel()
-	path := testtask.Path()
-	ts := httptest.NewServer(http.FileServer(http.Dir(filepath.Dir(path))))
-	defer ts.Close()
-
-	file := filepath.Base(path)
-	task := &structs.Task{
-		Name: "sleep",
-		Config: map[string]interface{}{
-			"artifact_source": fmt.Sprintf("%s/%s", ts.URL, file),
-			"command":         filepath.Join("$NOMAD_TASK_DIR", file),
-			"args":            []string{"sleep", "1s"},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -195,6 +158,10 @@ func TestRawExecDriver_Start_Wait(t *testing.T) {
 			"command": testtask.Path(),
 			"args":    []string{"sleep", "1s"},
 		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
 		Resources: basicResources,
 	}
 	testtask.SetTaskEnv(task)
@@ -231,7 +198,7 @@ func TestRawExecDriver_Start_Wait_AllocDir(t *testing.T) {
 	t.Parallel()
 	exp := []byte{'w', 'i', 'n'}
 	file := "output.txt"
-	outPath := fmt.Sprintf(`$%s/%s`, env.AllocDir, file)
+	outPath := fmt.Sprintf(`${%s}/%s`, env.AllocDir, file)
 	task := &structs.Task{
 		Name: "sleep",
 		Config: map[string]interface{}{
@@ -240,6 +207,10 @@ func TestRawExecDriver_Start_Wait_AllocDir(t *testing.T) {
 				"sleep", "1s",
 				"write", string(exp), outPath,
 			},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}
@@ -285,7 +256,11 @@ func TestRawExecDriver_Start_Kill_Wait(t *testing.T) {
 		Name: "sleep",
 		Config: map[string]interface{}{
 			"command": testtask.Path(),
-			"args":    []string{"sleep", "15s"},
+			"args":    []string{"sleep", "45s"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
 		},
 		Resources: basicResources,
 	}

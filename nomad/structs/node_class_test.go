@@ -46,7 +46,7 @@ func TestNode_ComputedClass(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	old := n.ComputedClass
@@ -64,7 +64,7 @@ func TestNode_ComputedClass(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 
@@ -79,7 +79,7 @@ func TestNode_ComputedClass_Ignore(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	old := n.ComputedClass
@@ -89,7 +89,7 @@ func TestNode_ComputedClass_Ignore(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 
@@ -104,7 +104,7 @@ func TestNode_ComputedClass_Attr(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	old := n.ComputedClass
@@ -123,7 +123,7 @@ func TestNode_ComputedClass_Attr(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	if old == n.ComputedClass {
@@ -138,7 +138,7 @@ func TestNode_ComputedClass_Meta(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	old := n.ComputedClass
@@ -148,7 +148,7 @@ func TestNode_ComputedClass_Meta(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	if old == n.ComputedClass {
@@ -161,7 +161,7 @@ func TestNode_ComputedClass_Meta(t *testing.T) {
 	if err := n.ComputeClass(); err != nil {
 		t.Fatalf("ComputeClass() failed: %v", err)
 	}
-	if n.ComputedClass == 0 {
+	if n.ComputedClass == "" {
 		t.Fatal("ComputeClass() didn't set computed class")
 	}
 	if old != n.ComputedClass {
@@ -172,34 +172,34 @@ func TestNode_ComputedClass_Meta(t *testing.T) {
 func TestNode_EscapedConstraints(t *testing.T) {
 	// Non-escaped constraints
 	ne1 := &Constraint{
-		LTarget: "$attr.kernel.name",
+		LTarget: "${attr.kernel.name}",
 		RTarget: "linux",
 		Operand: "=",
 	}
 	ne2 := &Constraint{
-		LTarget: "$meta.key_foo",
+		LTarget: "${meta.key_foo}",
 		RTarget: "linux",
 		Operand: "<",
 	}
 	ne3 := &Constraint{
-		LTarget: "$node.dc",
+		LTarget: "${node.dc}",
 		RTarget: "test",
 		Operand: "!=",
 	}
 
 	// Escaped constraints
 	e1 := &Constraint{
-		LTarget: "$attr.unique.kernel.name",
+		LTarget: "${attr.unique.kernel.name}",
 		RTarget: "linux",
 		Operand: "=",
 	}
 	e2 := &Constraint{
-		LTarget: "$meta.unique.key_foo",
+		LTarget: "${meta.unique.key_foo}",
 		RTarget: "linux",
 		Operand: "<",
 	}
 	e3 := &Constraint{
-		LTarget: "$unique.node.id",
+		LTarget: "${unique.node.id}",
 		RTarget: "test",
 		Operand: "!=",
 	}

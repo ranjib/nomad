@@ -229,7 +229,7 @@ func TestRetryMax(t *testing.T) {
 		calls += 1
 		return false, nil
 	}
-	err := retryMax(3, bad)
+	err := retryMax(3, bad, nil)
 	if err == nil {
 		t.Fatalf("should fail")
 	}
@@ -238,11 +238,28 @@ func TestRetryMax(t *testing.T) {
 	}
 
 	calls = 0
+	first := true
+	reset := func() bool {
+		if calls == 3 && first {
+			first = false
+			return true
+		}
+		return false
+	}
+	err = retryMax(3, bad, reset)
+	if err == nil {
+		t.Fatalf("should fail")
+	}
+	if calls != 6 {
+		t.Fatalf("mis match")
+	}
+
+	calls = 0
 	good := func() (bool, error) {
 		calls += 1
 		return true, nil
 	}
-	err = retryMax(3, good)
+	err = retryMax(3, good, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -558,7 +575,7 @@ func TestInplaceUpdate_Success(t *testing.T) {
 		DesiredStatus: structs.AllocDesiredStatusRun,
 	}
 	alloc.TaskResources = map[string]*structs.Resources{"web": alloc.Resources}
-	alloc.PopulateServiceIDs()
+	alloc.PopulateServiceIDs(job.TaskGroups[0])
 	noErr(t, state.UpsertAllocs(1001, []*structs.Allocation{alloc}))
 
 	webFeSrvID := alloc.Services["web-frontend"]
@@ -717,5 +734,25 @@ func TestInitTaskState(t *testing.T) {
 
 	if !(reflect.DeepEqual(expPending, actPending) && reflect.DeepEqual(expDead, actDead)) {
 		t.Fatal("Expected and actual not equal")
+	}
+}
+
+func TestProgressMade(t *testing.T) {
+	noopPlan := &structs.PlanResult{}
+	if progressMade(nil) || progressMade(noopPlan) {
+		t.Fatal("no progress plan marked as making progress")
+	}
+
+	m := map[string][]*structs.Allocation{
+		"foo": []*structs.Allocation{mock.Alloc()},
+	}
+	both := &structs.PlanResult{
+		NodeAllocation: m,
+		NodeUpdate:     m,
+	}
+	update := &structs.PlanResult{NodeUpdate: m}
+	alloc := &structs.PlanResult{NodeAllocation: m}
+	if !(progressMade(both) && progressMade(update) && progressMade(alloc)) {
+		t.Fatal("bad")
 	}
 }

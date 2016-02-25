@@ -67,7 +67,7 @@ func Job() *structs.Job {
 		Datacenters: []string{"dc1"},
 		Constraints: []*structs.Constraint{
 			&structs.Constraint{
-				LTarget: "$attr.kernel.name",
+				LTarget: "${attr.kernel.name}",
 				RTarget: "linux",
 				Operand: "=",
 			},
@@ -77,11 +77,10 @@ func Job() *structs.Job {
 				Name:  "web",
 				Count: 10,
 				RestartPolicy: &structs.RestartPolicy{
-					Attempts:         3,
-					Interval:         10 * time.Minute,
-					Delay:            1 * time.Minute,
-					RestartOnSuccess: true,
-					Mode:             structs.RestartPolicyModeDelay,
+					Attempts: 3,
+					Interval: 10 * time.Minute,
+					Delay:    1 * time.Minute,
+					Mode:     structs.RestartPolicyModeDelay,
 				},
 				Tasks: []*structs.Task{
 					&structs.Task{
@@ -103,9 +102,11 @@ func Job() *structs.Job {
 								PortLabel: "admin",
 							},
 						},
+						LogConfig: structs.DefaultLogConfig(),
 						Resources: &structs.Resources{
 							CPU:      500,
 							MemoryMB: 256,
+							DiskMB:   150,
 							Networks: []*structs.NetworkResource{
 								&structs.NetworkResource{
 									MBits:        50,
@@ -145,7 +146,7 @@ func SystemJob() *structs.Job {
 		Datacenters: []string{"dc1"},
 		Constraints: []*structs.Constraint{
 			&structs.Constraint{
-				LTarget: "$attr.kernel.name",
+				LTarget: "${attr.kernel.name}",
 				RTarget: "linux",
 				Operand: "=",
 			},
@@ -155,11 +156,10 @@ func SystemJob() *structs.Job {
 				Name:  "web",
 				Count: 1,
 				RestartPolicy: &structs.RestartPolicy{
-					Attempts:         3,
-					Interval:         10 * time.Minute,
-					Delay:            1 * time.Minute,
-					RestartOnSuccess: true,
-					Mode:             structs.RestartPolicyModeDelay,
+					Attempts: 3,
+					Interval: 10 * time.Minute,
+					Delay:    1 * time.Minute,
+					Mode:     structs.RestartPolicyModeDelay,
 				},
 				Tasks: []*structs.Task{
 					&structs.Task{
@@ -178,6 +178,7 @@ func SystemJob() *structs.Job {
 								},
 							},
 						},
+						LogConfig: structs.DefaultLogConfig(),
 					},
 				},
 			},

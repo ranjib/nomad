@@ -57,11 +57,31 @@ type Config struct {
 	// Node provides the base node
 	Node *structs.Node
 
+	// ClientMaxPort is the upper range of the ports that the client uses for
+	// communicating with plugin subsystems
+	ClientMaxPort uint
+
+	// ClientMinPort is the lower range of the ports that the client uses for
+	// communicating with plugin subsystems
+	ClientMinPort uint
+
 	// Options provides arbitrary key-value configuration for nomad internals,
 	// like fingerprinters and drivers. The format is:
 	//
 	//	namespace.option = value
 	Options map[string]string
+
+	// Version is the version of the Nomad client
+	Version string
+}
+
+func (c *Config) Copy() *Config {
+	nc := new(Config)
+	*nc = *c
+	nc.Node = nc.Node.Copy()
+	nc.Servers = structs.CopySliceString(nc.Servers)
+	nc.Options = structs.CopyMapStringString(nc.Options)
+	return nc
 }
 
 // Read returns the specified configuration value or "".

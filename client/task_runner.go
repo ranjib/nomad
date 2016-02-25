@@ -10,11 +10,27 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/hashstructure"
 
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+)
+
+const (
+	// killBackoffBaseline is the baseline time for exponential backoff while
+	// killing a task.
+	killBackoffBaseline = 5 * time.Second
+
+	// killBackoffLimit is the the limit of the exponential backoff for killing
+	// the task.
+	killBackoffLimit = 5 * time.Minute
+
+	// killFailureLimit is how many times we will attempt to kill a task before
+	// giving up and potentially leaking resources.
+	killFailureLimit = 10
 )
 
 // TaskRunner is used to wrap a task within an allocation and provide the execution context.
@@ -27,33 +43,43 @@ type TaskRunner struct {
 	restartTracker *RestartTracker
 	consulService  *ConsulService
 
-	task     *structs.Task
-	state    *structs.TaskState
-	updateCh chan *structs.Task
-	handle   driver.DriverHandle
+	task       *structs.Task
+	updateCh   chan *structs.Allocation
+	handle     driver.DriverHandle
+	handleLock sync.Mutex
 
 	destroy     bool
 	destroyCh   chan struct{}
 	destroyLock sync.Mutex
 	waitCh      chan struct{}
-
-	snapshotLock sync.Mutex
 }
 
 // taskRunnerState is used to snapshot the state of the task runner
 type taskRunnerState struct {
+	Version  string
 	Task     *structs.Task
 	HandleID string
 }
 
 // TaskStateUpdater is used to signal that tasks state has changed.
-type TaskStateUpdater func(taskName string)
+type TaskStateUpdater func(taskName, state string, event *structs.TaskEvent)
 
 // NewTaskRunner is used to create a new task context
 func NewTaskRunner(logger *log.Logger, config *config.Config,
 	updater TaskStateUpdater, ctx *driver.ExecContext,
-	alloc *structs.Allocation, task *structs.Task, state *structs.TaskState,
-	restartTracker *RestartTracker, consulService *ConsulService) *TaskRunner {
+	alloc *structs.Allocation, task *structs.Task,
+	consulService *ConsulService) *TaskRunner {
+
+	// Merge in the task resources
+	task.Resources = alloc.TaskResources[task.Name]
+
+	// Build the restart tracker.
+	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
+	if tg == nil {
+		logger.Printf("[ERR] client: alloc '%s' for missing task group '%s'", alloc.ID, alloc.TaskGroup)
+		return nil
+	}
+	restartTracker := newRestartTracker(tg.RestartPolicy, alloc.Job.Type)
 
 	tc := &TaskRunner{
 		config:         config,
@@ -64,11 +90,13 @@ func NewTaskRunner(logger *log.Logger, config *config.Config,
 		ctx:            ctx,
 		alloc:          alloc,
 		task:           task,
-		state:          state,
-		updateCh:       make(chan *structs.Task, 8),
+		updateCh:       make(chan *structs.Allocation, 8),
 		destroyCh:      make(chan struct{}),
 		waitCh:         make(chan struct{}),
 	}
+
+	// Set the state to pending.
+	tc.updater(task.Name, structs.TaskStatePending, structs.NewTaskEvent(structs.TaskReceived))
 	return tc
 }
 
@@ -116,21 +144,24 @@ func (r *TaskRunner) RestoreState() error {
 				r.task.Name, r.alloc.ID, err)
 			return nil
 		}
+		r.handleLock.Lock()
 		r.handle = handle
+		r.handleLock.Unlock()
 	}
 	return nil
 }
 
 // SaveState is used to snapshot our state
 func (r *TaskRunner) SaveState() error {
-	r.snapshotLock.Lock()
-	defer r.snapshotLock.Unlock()
 	snap := taskRunnerState{
-		Task: r.task,
+		Task:    r.task,
+		Version: r.config.Version,
 	}
+	r.handleLock.Lock()
 	if r.handle != nil {
 		snap.HandleID = r.handle.ID()
 	}
+	r.handleLock.Unlock()
 	return persistState(r.stateFilePath(), &snap)
 }
 
@@ -139,35 +170,15 @@ func (r *TaskRunner) DestroyState() error {
 	return os.RemoveAll(r.stateFilePath())
 }
 
-func (r *TaskRunner) appendEvent(event *structs.TaskEvent) {
-	capacity := 10
-	if r.state.Events == nil {
-		r.state.Events = make([]*structs.TaskEvent, 0, capacity)
-	}
-
-	// If we hit capacity, then shift it.
-	if len(r.state.Events) == capacity {
-		old := r.state.Events
-		r.state.Events = make([]*structs.TaskEvent, 0, capacity)
-		r.state.Events = append(r.state.Events, old[1:]...)
-	}
-
-	r.state.Events = append(r.state.Events, event)
-}
-
 // setState is used to update the state of the task runner
 func (r *TaskRunner) setState(state string, event *structs.TaskEvent) {
-	// Update the task.
-	r.state.State = state
-	r.appendEvent(event)
-
 	// Persist our state to disk.
 	if err := r.SaveState(); err != nil {
 		r.logger.Printf("[ERR] client: failed to save state of Task Runner: %v", r.task.Name)
 	}
 
 	// Indicate the task has been updated.
-	r.updater(r.task.Name)
+	r.updater(r.task.Name, state, event)
 }
 
 // createDriver makes a driver for the task
@@ -212,7 +223,9 @@ func (r *TaskRunner) startTask() error {
 		r.setState(structs.TaskStateDead, e)
 		return err
 	}
+	r.handleLock.Lock()
 	r.handle = handle
+	r.handleLock.Unlock()
 	r.setState(structs.TaskStateRunning, structs.NewTaskEvent(structs.TaskStarted))
 	return nil
 }
@@ -231,7 +244,10 @@ func (r *TaskRunner) run() {
 	var forceStart bool
 	for {
 		// Start the task if not yet started or it is being forced.
-		if r.handle == nil || forceStart {
+		r.handleLock.Lock()
+		handleEmpty := r.handle == nil
+		r.handleLock.Unlock()
+		if handleEmpty || forceStart {
 			forceStart = false
 			if err := r.startTask(); err != nil {
 				return
@@ -253,23 +269,27 @@ func (r *TaskRunner) run() {
 			case waitRes = <-r.handle.WaitCh():
 				break OUTER
 			case update := <-r.updateCh:
-				// Update
-				r.task = update
-				if err := r.handle.Update(update); err != nil {
-					r.logger.Printf("[ERR] client: failed to update task '%s' for alloc '%s': %v", r.task.Name, r.alloc.ID, err)
+				if err := r.handleUpdate(update); err != nil {
+					r.logger.Printf("[ERR] client: update to task %q failed: %v", r.task.Name, err)
 				}
 			case <-r.destroyCh:
-				// Avoid destroying twice
-				if destroyed {
-					continue
+				// Kill the task using an exponential backoff in-case of failures.
+				destroySuccess, err := r.handleDestroy()
+				if !destroySuccess {
+					// We couldn't successfully destroy the resource created.
+					r.logger.Printf("[ERR] client: failed to kill task %q. Resources may have been leaked: %v", r.task.Name, err)
+				} else {
+					// Wait for the task to exit but cap the time to ensure we don't block.
+					select {
+					case waitRes = <-r.handle.WaitCh():
+					case <-time.After(3 * time.Second):
+					}
 				}
 
-				// Send the kill signal, and use the WaitCh to block until complete
-				if err := r.handle.Kill(); err != nil {
-					r.logger.Printf("[ERR] client: failed to kill task '%s' for alloc '%s': %v", r.task.Name, r.alloc.ID, err)
-					destroyErr = err
-				}
+				// Store that the task has been destroyed and any associated error.
 				destroyed = true
+				destroyErr = err
+				break OUTER
 			}
 		}
 
@@ -321,7 +341,90 @@ func (r *TaskRunner) run() {
 		// Set force start because we are restarting the task.
 		forceStart = true
 	}
+}
 
+// handleUpdate takes an updated allocation and updates internal state to
+// reflect the new config for the task.
+func (r *TaskRunner) handleUpdate(update *structs.Allocation) error {
+	// Extract the task group from the alloc.
+	tg := update.Job.LookupTaskGroup(update.TaskGroup)
+	if tg == nil {
+		return fmt.Errorf("alloc '%s' missing task group '%s'", update.ID, update.TaskGroup)
+	}
+
+	// Extract the task.
+	var updatedTask *structs.Task
+	for _, t := range tg.Tasks {
+		if t.Name == r.task.Name {
+			updatedTask = t
+		}
+	}
+	if updatedTask == nil {
+		return fmt.Errorf("task group %q doesn't contain task %q", tg.Name, r.task.Name)
+	}
+
+	// Merge in the task resources
+	updatedTask.Resources = update.TaskResources[updatedTask.Name]
+
+	// Update will update resources and store the new kill timeout.
+	var mErr multierror.Error
+	r.handleLock.Lock()
+	if r.handle != nil {
+		if err := r.handle.Update(updatedTask); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("updating task resources failed: %v", err))
+		}
+	}
+	r.handleLock.Unlock()
+
+	// Update the restart policy.
+	if r.restartTracker != nil {
+		r.restartTracker.SetPolicy(tg.RestartPolicy)
+	}
+
+	// Hash services returns the hash of the task's services
+	hashServices := func(task *structs.Task) uint64 {
+		h, err := hashstructure.Hash(task.Services, nil)
+		if err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("hashing services failed %#v: %v", task.Services, err))
+		}
+		return h
+	}
+
+	// Re-register the task to consul if any of the services have changed.
+	if hashServices(updatedTask) != hashServices(r.task) {
+		if err := r.consulService.Register(updatedTask, update); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("updating services with consul failed: %v", err))
+		}
+	}
+
+	// Store the updated alloc.
+	r.alloc = update
+	r.task = updatedTask
+	return mErr.ErrorOrNil()
+}
+
+// handleDestroy kills the task handle. In the case that killing fails,
+// handleDestroy will retry with an exponential backoff and will give up at a
+// given limit. It returns whether the task was destroyed and the error
+// associated with the last kill attempt.
+func (r *TaskRunner) handleDestroy() (destroyed bool, err error) {
+	// Cap the number of times we attempt to kill the task.
+	for i := 0; i < killFailureLimit; i++ {
+		if err = r.handle.Kill(); err != nil {
+			// Calculate the new backoff
+			backoff := (1 << (2 * uint64(i))) * killBackoffBaseline
+			if backoff > killBackoffLimit {
+				backoff = killBackoffLimit
+			}
+
+			r.logger.Printf("[ERR] client: failed to kill task '%s' for alloc %q. Retrying in %v: %v",
+				r.task.Name, r.alloc.ID, backoff, err)
+			time.Sleep(time.Duration(backoff))
+		} else {
+			// Kill was successful
+			return true, nil
+		}
+	}
 	return
 }
 
@@ -334,12 +437,12 @@ func (r *TaskRunner) waitErrorToEvent(res *cstructs.WaitResult) *structs.TaskEve
 }
 
 // Update is used to update the task of the context
-func (r *TaskRunner) Update(update *structs.Task) {
+func (r *TaskRunner) Update(update *structs.Allocation) {
 	select {
 	case r.updateCh <- update:
 	default:
 		r.logger.Printf("[ERR] client: dropping task update '%s' (alloc '%s')",
-			update.Name, r.alloc.ID)
+			r.task.Name, r.alloc.ID)
 	}
 }
 
